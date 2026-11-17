@@ -1,0 +1,158 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+  log_level: "INFO"
+
+local_backend:
+  url: "http://127.0.0.1:8080"
+  model_name: "Qwen3.6-35B-A3B"
+  max_context: 262144
+  health_timeout_sec: 0.5
+  queue:
+    max_size: 5
+    same_session_timeout_sec: 45 # Сколько ждать освобождения слота своей сессии
+    grace_period_sec: 60         # Защита горячего слота за сессией после завершения генерации
+    local_only_timeout_sec: 120  # Сколько ждать в режиме local-only
+  cache:
+    idle_clear_sec: 1800         # Автоочистка KV-кэша при простое 30 мин (0 = выкл)
+    auto_clear_on_context_shift: true
+
+providers:
+  cerebras:
+    name: "Cerebras Fast Cloud"
+    base_url: "https://api.cerebras.ai/v1"
+    api_key_env: "CEREBRAS_API_KEYS"
+    enabled: true
+    use_proxy: false
+    timeout_sec: 60
+    models:
+      - id: "llama3.1-8b"
+        tags: ["fast", "tools"]
+        tier: "fast"
+      - id: "llama-3.3-70b"
+        tags: ["coding", "tools", "smart"]
+        tier: "executor"
+
+  groq:
+    name: "Groq Cloud"
+    base_url: "https://api.groq.com/openai/v1"
+    api_key_env: "GROQ_API_KEYS"
+    enabled: true
+    use_proxy: false
+    timeout_sec: 60
+    models:
+      - id: "qwen-2.5-coder-32b"
+        tags: ["coding", "tools"]
+        tier: "executor"
+      - id: "llama-3.3-70b-versatile"
+        tags: ["smart", "tools", "coding"]
+        tier: "executor"
+
+  sambanova:
+    name: "SambaNova Cloud"
+    base_url: "https://api.sambanova.ai/v1"
+    api_key_env: "SAMBANOVA_API_KEYS"
+    enabled: true
+    use_proxy: false
+    timeout_sec: 60
+    models:
+      - id: "Meta-Llama-3.3-70B-Instruct"
+        tags: ["coding", "tools", "smart"]
+        tier: "executor"
+
+  openrouter:
+    name: "OpenRouter"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEYS"
+    enabled: true
+    use_proxy: false
+    timeout_sec: 90
+    extra_headers:
+      HTTP-Referer: "https://github.com/localAiRouter"
+      X-Title: "Local AI Gateway"
+    only_free_models: false
+
+aliases:
+  auto-architect:
+    description: "Cloud reasoning/planner models for high-level thinking & architecture"
+    models:
+      - "deepseek-r1"
+      - "qwq-32b"
+      - "llama-3.3-70b"
+    provider_priority: ["openrouter", "groq", "sambanova", "local"]
+    prefer_tags: ["reasoning", "smart"]
+    default_sampling:
+      temperature: 0.6
+      top_p: 0.95
+
+  auto-executor:
+    description: "Primary coding executor: local Qwen 35B with cloud coding fallback"
+    models:
+      - "Qwen3.6-35B-A3B"              # 1-й приоритет: локальный Qwen
+      - "qwen-2.5-coder-32b"           # 2-й приоритет: облачный Qwen Coder
+      - "llama-3.3-70b"                # 3-й приоритет: Llama 70B
+    provider_priority: ["local", "groq", "cerebras", "sambanova", "openrouter"] # Если модель есть у нескольких
+    require_tools: true
+    prefer_tags: ["coding"]
+    default_sampling:
+      temperature: 0.2
+      top_p: 0.95
+
+  local-only:
+    description: "Strictly local Qwen3.6 execution with KV-cache reuse"
+    models:
+      - "Qwen3.6-35B-A3B"
+    provider_priority: ["local"]
+
+  auto-fast:
+    description: "Ultra-fast response for small tasks"
+    models:
+      - "llama3.1-8b"
+    provider_priority: ["cerebras", "groq", "sambanova", "local"]
+    prefer_tags: ["fast"]
+
+  auto-vision:
+    description: "Multimodal tasks with image preprocessing"
+    provider_priority: ["openrouter", "groq", "local"]
+    require_vision: true
+
+image_processing:
+  enabled: true                  # Главный переключатель (false = полное отключение обработки)
+  local:
+    enabled: true
+    max_side_px: 896             # Ресайз по длинной стороне для CPU mmproj
+    output_format: "JPEG"        # JPEG или WEBP
+    quality: 85                  # Качество сжатия (1-100)
+    convert_transparent_to_bg: "#FFFFFF" # Заливка альфа-канала PNG белым
+    grayscale: false             # Опционально: ч/б режим для ускорения OCR текста
+  cloud:
+    enabled: true
+    max_side_px: 2048
+    quality: 90
+
+routing:
+  # Режим выбора моделей:
+  # "user_first" - сначала проверяются модели, заданные пользователем в config.yaml,
+  #                а затем дополняются эвристически ранжированными моделями из Discovery.
+  # "user_only"  - строго только модели, явно указанные пользователем в config.yaml.
+  model_selection_mode: "user_first"
+  provider_priority: ["local", "cerebras", "groq", "sambanova", "openrouter"]
+  sticky_sessions: true          # Фиксация выбранной модели за сессией
+  session_ttl_sec: 7200          # Очистка неактивных сессий из RAM через 2 часа
+  key_cooldown_sec: 60           # Базовый карантин ключа при 429/5xx
+  discovery_refresh_hours: 6     # Автообновление списка моделей провайдеров
+
+discovery:
+  enabled: true
+  refresh_hours: 6
+  llm_classifier:
+    enabled: true                # Двойная гибридная классификация: эвристика + LLM
+    provider: "cerebras"         # Быстрый облачный провайдер для фоновой классификации
+    model: "llama3.1-8b"         # Легкая модель для анализа названий и метаданных
+    batch_size: 25               # Размер пакета моделей за один запрос
+    timeout_sec: 20.0
+  context_tiers:
+    huge: 131072                 # Порог огромного контекста (128k+)
+    large: 65536                 # Порог большого контекста (64k+)
+    medium: 32768                # Порог среднего контекста (32k+)
+    small: 8192                  # Малый контекст (<32k)
