@@ -161,6 +161,90 @@ async def run_diagnostics(deep: bool = False):
 
     console.print(alias_table)
 
+    # 4. System & Hardware Metrics
+    import system_monitor
+    sys_metrics = system_monitor.get_full_system_metrics()
+    cpu = sys_metrics.get("cpu", {})
+    mem = sys_metrics.get("memory", {})
+    gpu = sys_metrics.get("gpu", {})
+    disk = sys_metrics.get("disk", {})
+    temps = sys_metrics.get("temperatures", [])
+
+    sys_table = Table(title="Hardware & System Resource Status", border_style="yellow")
+    sys_table.add_column("Subsystem", style="bold yellow")
+    sys_table.add_column("Details")
+    sys_table.add_column("Utilization / Status")
+
+    # CPU
+    cpu_model = cpu.get("model_name", "Host CPU")
+    cpu_freq_str = f" @ {int(cpu.get('frequency_mhz'))} MHz" if cpu.get("frequency_mhz") else ""
+    cpu_temp_str = f" | Temp: {cpu.get('temperature_c')}°C" if cpu.get("temperature_c") else ""
+    sys_table.add_row(
+        f"CPU ({cpu_model})",
+        f"{cpu.get('physical_cores', 1)} Cores / {cpu.get('logical_cores', 1)} Threads{cpu_freq_str}{cpu_temp_str}",
+        f"{cpu.get('overall_percent', 0.0)}%"
+    )
+
+    # RAM
+    ram_str = f"{mem.get('ram_used_gb', 0)} / {mem.get('ram_total_gb', 0)} GB (Free: {mem.get('ram_available_gb', 0)} GB)"
+    sys_table.add_row("RAM Memory", ram_str, f"{mem.get('ram_percent', 0)}%")
+
+    # Swap (if present)
+    if mem.get("swap_total_gb", 0) > 0:
+        sys_table.add_row("Swap", f"{mem.get('swap_used_gb', 0)} / {mem.get('swap_total_gb', 0)} GB", f"{mem.get('swap_percent', 0)}%")
+
+    # GPU
+    if gpu.get("available"):
+        gpu_name = gpu.get("name", "GPU")
+        vram_str = f"VRAM: {gpu.get('vram_used_gb', 0)} / {gpu.get('vram_total_gb', 0)} GB ({gpu.get('vram_percent', 0)}%)" if gpu.get("vram_total_gb", 0) > 0 else "Active"
+        power_str = f" | Power: {gpu.get('power_watts')} W" if gpu.get('power_watts') else ""
+        temps_gpu = []
+        gpu_sensors = gpu.get("sensors", {})
+        if gpu_sensors:
+            for s_name, s_val in gpu_sensors.items():
+                temps_gpu.append(f"{s_name}: {s_val}°C")
+        elif gpu.get("temp_c") is not None:
+            temps_gpu.append(f"{gpu['temp_c']}°C")
+        elif gpu.get("temp_edge_c") is not None:
+            temps_gpu.append(f"Edge: {gpu.get('temp_edge_c')}°C")
+
+        gpu_details = f"{vram_str}{power_str}" + (f" | {' / '.join(temps_gpu)}" if temps_gpu else "")
+        status_str = f"{gpu.get('gpu_percent', 0)}%" if gpu.get("gpu_percent", 0) > 0 else "[green]DETECTED[/green]"
+        sys_table.add_row(f"GPU ({gpu_name})", gpu_details, status_str)
+    else:
+        sys_table.add_row("GPU", gpu.get("name", "No accelerator detected"), "[dim]N/A[/dim]")
+
+    # Disk
+    disk_str = f"{disk.get('used_gb', 0)} / {disk.get('total_gb', 0)} GB on {disk.get('path', '/')}"
+    sys_table.add_row("Disk Storage", disk_str, f"{disk.get('percent', 0)}%")
+
+    console.print()
+    console.print(sys_table)
+
+    # Temperatures table (if any detected)
+    if temps:
+        temp_table = Table(title="Hardware Thermal Sensors (°C)", border_style="red")
+        temp_table.add_column("Chip / Device", style="bold cyan")
+        temp_table.add_column("Sensor Zone")
+        temp_table.add_column("Current")
+        temp_table.add_column("High")
+        temp_table.add_column("Critical")
+        temp_table.add_column("Status")
+
+        for t in temps:
+            st = t.get("status", "normal")
+            color = "green" if st == "normal" else ("yellow" if st == "warning" else "bold red")
+            temp_table.add_row(
+                t.get("chip", "-"),
+                t.get("label", "-"),
+                f"[{color}]{t.get('current_c')}°C[/{color}]",
+                f"{t.get('high_c')}°C" if t.get("high_c") else "-",
+                f"{t.get('critical_c')}°C" if t.get("critical_c") else "-",
+                f"[{color}]{st.upper()}[/{color}]"
+            )
+        console.print()
+        console.print(temp_table)
+
 
 if __name__ == "__main__":
     deep_mode = "--deep" in sys.argv

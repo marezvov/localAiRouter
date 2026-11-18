@@ -128,12 +128,22 @@ def test_api_endpoints_with_test_client():
         assert json_data["status"] == "healthy"
         assert "local_backend" in json_data
         assert "aliases" in json_data
+        assert "system" in json_data
+        assert "cpu" in json_data["system"]
+        assert "memory" in json_data["system"]
+        assert "gpu" in json_data["system"]
+        assert "temperatures" in json_data["system"]
+        assert "disk" in json_data["system"]
 
-        # 2. Health HTML Dashboard
+        # 2. Health HTML Dashboard with Tab Navigation
         resp_html = client.get("/health", headers={"Accept": "text/html"})
         assert resp_html.status_code == 200
         assert "<!DOCTYPE html>" in resp_html.text
         assert "AI Gateway Dashboard" in resp_html.text
+        assert "tab-gateway" in resp_html.text
+        assert "tab-system" in resp_html.text
+        assert "switchTab" in resp_html.text
+        assert "localStorage.getItem('active_tab')" in resp_html.text
 
         # 3. Models list without auth -> 401
         resp_no_auth = client.get("/v1/models")
