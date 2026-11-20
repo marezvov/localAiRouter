@@ -475,6 +475,96 @@ async def test_single_key(request: Request, _auth: bool = Depends(verify_auth)):
         return {"ok": False, "status": "ERROR", "latency_ms": lat, "error": str(e)[:60]}
 
 
+@app.post("/v1/admin/fetch-models")
+async def admin_fetch_models(request: Request, _auth: bool = Depends(verify_auth)):
+    """Запрашивает список доступных моделей с API-ключа указанного провайдера или всех провайдеров."""
+    if not discovery_svc:
+        raise HTTPException(status_code=503, detail="Discovery service not initialized")
+
+    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    provider_id = body.get("provider_id", "").strip().lower()
+    explicit_key = body.get("key", "").strip() or None
+
+    cfg = config_loader.get_config()
+
+    if provider_id and provider_id != "all":
+        pcfg = cfg.providers.get(provider_id)
+        if not pcfg:
+            raise HTTPException(status_code=404, detail=f"Provider '{provider_id}' not found in configuration")
+
+        models = await discovery_svc.fetch_provider_models(provider_id, pcfg, explicit_key=explicit_key)
+        return {
+            "status": "ok",
+            "provider_id": provider_id,
+            "count": len(models),
+            "models": models,
+        }
+    else:
+        cache = await discovery_svc.refresh_all(force=True)
+        return {
+            "status": "ok",
+            "provider_id": "all",
+            "providers": cache.get("providers", {}),
+            "updated_at": cache.get("updated_at"),
+        }
+
+
+@app.get("/v1/admin/models-catalog")
+async def get_models_catalog(_auth: bool = Depends(verify_auth)):
+    """Возвращает полный каталог моделей, алиасов и приоритетов для администрирования."""
+    if not discovery_svc:
+        raise HTTPException(status_code=503, detail="Discovery service not initialized")
+
+    cfg = config_loader.get_config()
+    aliases_res = {}
+    for aname, acfg in cfg.aliases.items():
+        aliases_res[aname] = {
+            "description": acfg.description,
+            "models": acfg.models,
+            "provider_priority": acfg.provider_priority or acfg.priority or cfg.routing.provider_priority,
+            "prefer_tags": acfg.prefer_tags,
+            "require_tools": acfg.require_tools,
+            "require_vision": acfg.require_vision,
+        }
+
+    return {
+        "status": "ok",
+        "providers_models": discovery_svc._cache.get("providers", {}),
+        "aliases": aliases_res,
+        "routing": {
+            "provider_priority": cfg.routing.provider_priority,
+            "model_selection_mode": cfg.routing.model_selection_mode,
+        },
+        "local_model": cfg.local_backend.model_name,
+        "providers": list(cfg.providers.keys()),
+    }
+
+
+@app.post("/v1/admin/save-priorities")
+async def admin_save_priorities(request: Request, _auth: bool = Depends(verify_auth)):
+    """Сохраняет измененные приоритеты, алиасы и режим маршрутизации в config.yaml."""
+    body = await request.json()
+    aliases = body.get("aliases")
+    provider_priority = body.get("provider_priority")
+    model_selection_mode = body.get("model_selection_mode")
+
+    config_loader.save_priorities_and_aliases_to_config(
+        aliases=aliases,
+        provider_priority=provider_priority,
+        model_selection_mode=model_selection_mode,
+    )
+
+    new_cfg, new_sec = config_loader.reload_config()
+
+    global router_svc, discovery_svc
+    if router_svc:
+        router_svc.config = new_cfg
+    if discovery_svc:
+        discovery_svc.config = new_cfg
+
+    return {"status": "ok", "message": "Приоритеты и алиасы успешно сохранены в config.yaml"}
+
+
 
 # -------------------------------------------------------------
 # Diagnostic Health & Web Dashboard (/health)
@@ -797,6 +887,17 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
         .badge-ping {{ padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; font-family: monospace; display: inline-block; }}
         .badge-ping-ok {{ background: #064e3b; color: #34d399; border: 1px solid #059669; }}
         .badge-ping-err {{ background: #7f1d1d; color: #f87171; border: 1px solid #dc2626; }}
+
+        .badge-tag {{ padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; display: inline-block; margin-right: 4px; margin-bottom: 2px; }}
+        .tag-coding {{ background: #064e3b; color: #34d399; border: 1px solid #059669; }}
+        .tag-tools {{ background: #1e3a8a; color: #60a5fa; border: 1px solid #2563eb; }}
+        .tag-vision {{ background: #581c87; color: #c084fc; border: 1px solid #7c3aed; }}
+        .tag-reasoning {{ background: #701a75; color: #f472b6; border: 1px solid #c026d3; }}
+        .tag-fast {{ background: #78350f; color: #fcd34d; border: 1px solid #d97706; }}
+        .tag-smart {{ background: #134e4a; color: #2dd4bf; border: 1px solid #0d9488; }}
+        .tag-default {{ background: #334155; color: #94a3b8; border: 1px solid #475569; }}
+        .alias-card {{ background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; }}
+        .prov-pill {{ background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 4px 8px; font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }}
     </style>
 </head>
 <body>
@@ -817,6 +918,9 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
             </button>
             <button id="btn-tab-system" class="tab-btn" onclick="switchTab('system')">
                 &#128421; Система и Температуры
+            </button>
+            <button id="btn-tab-models" class="tab-btn" onclick="switchTab('models')">
+                &#127919; Модели и Приоритеты
             </button>
             <button id="btn-tab-keys" class="tab-btn" onclick="switchTab('keys')">
                 &#128273; Ключи и Провайдеры
@@ -984,7 +1088,121 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
             </div>
         </div>
 
-        <!-- TAB 3: KEYS & PROVIDERS MANAGEMENT -->
+        <!-- TAB 3: MODELS & PRIORITIES MANAGEMENT -->
+        <div id="tab-models" class="tab-pane" style="display: none;">
+            <!-- State 1: Locked / Login Box -->
+            <div id="models-auth-box" style="max-width: 480px; margin: 40px auto; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 30px; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.3);">
+                <div style="font-size: 42px; margin-bottom: 12px;">&#128274;</div>
+                <h3 style="font-size: 19px; color: #f8fafc; margin-bottom: 8px;">Управление моделями и приоритетами</h3>
+                <p style="font-size: 13px; color: #94a3b8; line-height: 1.5; margin-bottom: 22px;">
+                    Для просмотра каталога моделей провайдеров и изменения приоритетов требуется авторизация администратора.
+                </p>
+                <div style="margin-bottom: 16px; text-align: left;">
+                    <label style="font-size: 12px; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 6px;">Мастер-ключ или пароль:</label>
+                    <input type="password" id="models-auth-pwd" placeholder="Введите ключ или пароль..." class="admin-input" style="font-size: 14px; padding: 10px 14px;" onkeydown="if(event.key==='Enter') doLoginFromModels()">
+                </div>
+                <div id="models-auth-err" style="display: none; background: #7f1d1d33; border: 1px solid #ef4444; border-radius: 6px; padding: 8px; color: #f87171; font-size: 12px; margin-bottom: 14px;"></div>
+                <button class="action-btn" style="width: 100%; padding: 11px; font-size: 14px;" onclick="doLoginFromModels()">&#128273; Войти в панель управления</button>
+            </div>
+
+            <!-- State 2: Authenticated Models & Priorities Panel -->
+            <div id="models-admin-panel" style="display: none;">
+                <!-- Action Bar -->
+                <div style="display: flex; justify-content: space-between; align-items: center; background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px 20px; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
+                    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                        <button class="action-btn" style="background: #059669;" onclick="fetchAllCloudModels()">&#128229; Собрать модели со всех ключей</button>
+                        <div style="display: flex; gap: 6px; align-items: center;">
+                            <select id="fetch-prov-select" class="admin-input" style="width: auto; padding: 8px 10px; font-size: 12px;">
+                                <!-- populated dynamically -->
+                            </select>
+                            <button class="action-btn btn-secondary" style="font-size: 12px; padding: 8px 12px;" onclick="fetchSelectedProviderModels()">&#128229; Опросить ключ</button>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <button class="action-btn" style="background: #2563eb;" onclick="saveAllPriorities()">&#128190; Сохранить приоритеты в config.yaml</button>
+                        <button class="action-btn btn-secondary" onclick="loadModelsCatalog()">&#128260; Сбросить</button>
+                    </div>
+                </div>
+
+                <!-- Global Routing Configuration -->
+                <div class="table-card">
+                    <h3>&#129517; Глобальная маршрутизация и приоритет поставщиков</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 14px;">
+                        <div>
+                            <label style="font-size: 12px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 6px;">Режим выбора моделей (model_selection_mode):</label>
+                            <select id="sel-model-mode" class="admin-input">
+                                <option value="user_first">user_first — Ручные приоритеты первыми, затем автоподбор по эвристикам</option>
+                                <option value="user_only">user_only — Строго ТОЛЬКО явно указанные в конфиге модели</option>
+                            </select>
+                            <div style="font-size: 11px; color: #64748b; margin-top: 4px;">Определяет, может ли роутер автоматически подбирать облачные модели с нужными тегами</div>
+                        </div>
+                        <div>
+                            <label style="font-size: 12px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 6px;">Глобальный приоритет поставщиков (provider_priority):</label>
+                            <div id="global-providers-prio" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;">
+                                <!-- Populated dynamically -->
+                            </div>
+                            <div style="font-size: 11px; color: #64748b; margin-top: 4px;">Используйте стрелки &larr; и &rarr; для изменения предпочтительного поставщика при совпадении моделей</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Virtual Aliases & Model Priorities -->
+                <div class="table-card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <h3>&#127919; Приоритеты моделей в виртуальных алиасах (Model-First)</h3>
+                        <span style="font-size: 12px; color: #64748b;">Первая модель = 1-й выбор; последующие = резервные фоллбэки</span>
+                    </div>
+                    <div id="aliases-priority-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 16px; margin-top: 12px;">
+                        <!-- Populated dynamically -->
+                    </div>
+                </div>
+
+                <!-- Live Model Catalog / Explorer -->
+                <div class="table-card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px;">
+                        <div>
+                            <h3>&#128269; Каталог моделей, обнаруженных с API-ключей</h3>
+                            <div style="font-size: 12px; color: #64748b; margin-top: 2px;">Модели, доступные через ваши ключи и локальный узел</div>
+                        </div>
+                        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+                            <input type="text" id="model-filter-text" placeholder="Поиск (qwen, llama, deepseek, 70b)..." class="admin-input" style="width: 220px;" oninput="filterCatalogTable()">
+                            <select id="model-filter-prov" class="admin-input" style="width: auto;" onchange="filterCatalogTable()">
+                                <option value="">Все провайдеры</option>
+                            </select>
+                            <select id="model-filter-tag" class="admin-input" style="width: auto;" onchange="filterCatalogTable()">
+                                <option value="">Все теги</option>
+                                <option value="coding">Coding (код)</option>
+                                <option value="tools">Tools (инструменты)</option>
+                                <option value="vision">Vision (зрение)</option>
+                                <option value="reasoning">Reasoning (рассуждения)</option>
+                                <option value="fast">Fast (скорость)</option>
+                                <option value="smart">Smart (большие модели)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="max-height: 480px; overflow-y: auto; border: 1px solid #334155; border-radius: 8px;">
+                        <table style="width: 100%;">
+                            <thead style="position: sticky; top: 0; background: #1e293b; z-index: 5;">
+                                <tr>
+                                    <th>ID модели</th>
+                                    <th>Канон</th>
+                                    <th>Поставщик</th>
+                                    <th>Контекст</th>
+                                    <th>Теги возможностей</th>
+                                    <th style="text-align: right;">Добавить в алиас</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-catalog-models">
+                                <!-- Populated dynamically -->
+                            </tbody>
+                        </table>
+                    </div>
+                    <div id="catalog-count-info" style="font-size: 12px; color: #94a3b8; margin-top: 8px;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 4: KEYS & PROVIDERS MANAGEMENT -->
         <div id="tab-keys" class="tab-pane" style="display: none;">
             <!-- State 1: Locked / Login Box -->
             <div id="keys-auth-box" style="max-width: 480px; margin: 40px auto; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 30px; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.3);">
@@ -1122,6 +1340,8 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
 
             if (tabId === 'keys') {{
                 checkKeysAuth();
+            }} else if (tabId === 'models') {{
+                checkModelsAuth();
             }}
         }}
 
@@ -1139,36 +1359,423 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
             }}
         }}
 
-        async function doLogin() {{
-            const pwdInput = document.getElementById('auth-pwd-input');
-            const errMsg = document.getElementById('auth-error-msg');
-            const pwd = (pwdInput ? pwdInput.value : '').trim();
-            if (!pwd) {{
-                if (errMsg) {{ errMsg.innerText = 'Пожалуйста, введите пароль или мастер-ключ'; errMsg.style.display = 'block'; }}
+        function checkModelsAuth() {{
+            const token = getAuthToken();
+            const authBox = document.getElementById('models-auth-box');
+            const adminPanel = document.getElementById('models-admin-panel');
+            if (!token) {{
+                if (authBox) authBox.style.display = 'block';
+                if (adminPanel) adminPanel.style.display = 'none';
+            }} else {{
+                if (authBox) authBox.style.display = 'none';
+                if (adminPanel) adminPanel.style.display = 'block';
+                loadModelsCatalog();
+            }}
+        }}
+
+        async function doSharedLogin(pwdVal, errEl) {{
+            if (!pwdVal) {{
+                if (errEl) {{ errEl.innerText = 'Пожалуйста, введите пароль или мастер-ключ'; errEl.style.display = 'block'; }}
                 return;
             }}
             try {{
                 const res = await fetch('/v1/admin/login', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ password: pwd }})
+                    body: JSON.stringify({{ password: pwdVal }})
                 }});
                 const data = await res.json();
                 if (res.ok && data.token) {{
                     setAuthToken(data.token);
-                    if (errMsg) errMsg.style.display = 'none';
+                    if (errEl) errEl.style.display = 'none';
                     checkKeysAuth();
+                    checkModelsAuth();
                 }} else {{
-                    if (errMsg) {{ errMsg.innerText = data.detail || 'Неверный пароль или мастер-ключ'; errMsg.style.display = 'block'; }}
+                    if (errEl) {{ errEl.innerText = data.detail || 'Неверный пароль или мастер-ключ'; errEl.style.display = 'block'; }}
                 }}
             }} catch (e) {{
-                if (errMsg) {{ errMsg.innerText = 'Ошибка подключения: ' + e; errMsg.style.display = 'block'; }}
+                if (errEl) {{ errEl.innerText = 'Ошибка подключения: ' + e; errEl.style.display = 'block'; }}
             }}
+        }}
+
+        async function doLogin() {{
+            const pwd = (document.getElementById('auth-pwd-input') ? document.getElementById('auth-pwd-input').value : '').trim();
+            const err = document.getElementById('auth-error-msg');
+            await doSharedLogin(pwd, err);
+        }}
+
+        async function doLoginFromModels() {{
+            const pwd = (document.getElementById('models-auth-pwd') ? document.getElementById('models-auth-pwd').value : '').trim();
+            const err = document.getElementById('models-auth-err');
+            await doSharedLogin(pwd, err);
         }}
 
         function doLogout() {{
             setAuthToken('');
             checkKeysAuth();
+            checkModelsAuth();
+        }}
+
+        let activeCatalogData = null;
+
+        async function loadModelsCatalog() {{
+            const token = getAuthToken();
+            if (!token) return;
+            try {{
+                const res = await fetch('/v1/admin/models-catalog', {{
+                    headers: {{ 'Authorization': 'Bearer ' + token }}
+                }});
+                if (res.status === 401) {{
+                    doLogout();
+                    return;
+                }}
+                const data = await res.json();
+                activeCatalogData = data;
+                renderModelsAndPriorities(data);
+            }} catch (e) {{
+                console.error('Failed to load models catalog:', e);
+            }}
+        }}
+
+        function renderModelsAndPriorities(data) {{
+            const selMode = document.getElementById('sel-model-mode');
+            if (selMode && data.routing) {{
+                selMode.value = data.routing.model_selection_mode || 'user_first';
+            }}
+
+            renderGlobalProviderPriority();
+            renderAliasesPriorityGrid();
+
+            const provSelect = document.getElementById('fetch-prov-select');
+            const provFilter = document.getElementById('model-filter-prov');
+            if (provSelect && data.providers) {{
+                provSelect.innerHTML = data.providers.map(p => `<option value="${{p}}">${{p}}</option>`).join('');
+            }}
+            if (provFilter && data.providers) {{
+                const currentVal = provFilter.value;
+                let optHtml = '<option value="">Все провайдеры</option><option value="local">local (локальный)</option>';
+                data.providers.forEach(p => {{
+                    optHtml += `<option value="${{p}}">${{p}}</option>`;
+                }});
+                provFilter.innerHTML = optHtml;
+                provFilter.value = currentVal;
+            }}
+
+            filterCatalogTable();
+        }}
+
+        function renderGlobalProviderPriority() {{
+            const container = document.getElementById('global-providers-prio');
+            if (!container || !activeCatalogData || !activeCatalogData.routing) return;
+            const prio = activeCatalogData.routing.provider_priority || [];
+            container.innerHTML = prio.map((p, idx) => `
+                <div class="prov-pill">
+                    <span style="color: #94a3b8; font-weight: bold;">${{idx + 1}}.</span>
+                    <strong style="color: #38bdf8;">${{p}}</strong>
+                    <button class="action-btn btn-secondary" style="padding: 1px 5px; font-size: 10px;" ${{idx === 0 ? 'disabled style="opacity:0.3;"' : ''}} onclick="moveGlobalProvider(${{idx}}, ${{idx - 1}})">&#8592;</button>
+                    <button class="action-btn btn-secondary" style="padding: 1px 5px; font-size: 10px;" ${{idx === prio.length - 1 ? 'disabled style="opacity:0.3;"' : ''}} onclick="moveGlobalProvider(${{idx}}, ${{idx + 1}})">&#8594;</button>
+                </div>
+            `).join('');
+        }}
+
+        function moveGlobalProvider(fromIdx, toIdx) {{
+            if (!activeCatalogData || !activeCatalogData.routing) return;
+            const arr = activeCatalogData.routing.provider_priority;
+            if (toIdx < 0 || toIdx >= arr.length) return;
+            const tmp = arr[fromIdx];
+            arr[fromIdx] = arr[toIdx];
+            arr[toIdx] = tmp;
+            renderGlobalProviderPriority();
+        }}
+
+        function renderAliasesPriorityGrid() {{
+            const container = document.getElementById('aliases-priority-grid');
+            if (!container || !activeCatalogData || !activeCatalogData.aliases) return;
+
+            let html = '';
+            for (const [aname, acfg] of Object.entries(activeCatalogData.aliases)) {{
+                const models = acfg.models || [];
+                const prio = acfg.provider_priority || [];
+
+                let modelsListHtml = '';
+                if (models.length === 0) {{
+                    modelsListHtml = '<div style="font-size: 12px; color: #64748b; padding: 6px 0;">Модели не заданы (роутер подбирает по тегам)</div>';
+                }} else {{
+                    modelsListHtml = models.map((m, mIdx) => `
+                        <div style="display: flex; justify-content: space-between; align-items: center; background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; margin-bottom: 6px;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="color: #94a3b8; font-size: 12px; font-weight: 700;">#${{mIdx + 1}}</span>
+                                <span style="font-family: monospace; color: #f8fafc; font-size: 13px;">${{m}}</span>
+                            </div>
+                            <div style="display: flex; gap: 4px;">
+                                <button class="action-btn btn-secondary" style="padding: 2px 6px; font-size: 11px;" ${{mIdx === 0 ? 'disabled style="opacity:0.3;"' : ''}} onclick="moveModelInAlias('${{aname}}', ${{mIdx}}, ${{mIdx - 1}})">&#8593;</button>
+                                <button class="action-btn btn-secondary" style="padding: 2px 6px; font-size: 11px;" ${{mIdx === models.length - 1 ? 'disabled style="opacity:0.3;"' : ''}} onclick="moveModelInAlias('${{aname}}', ${{mIdx}}, ${{mIdx + 1}})">&#8595;</button>
+                                <button class="action-btn btn-danger" style="padding: 2px 6px; font-size: 11px;" onclick="removeModelFromAlias('${{aname}}', ${{mIdx}})">&#10005;</button>
+                            </div>
+                        </div>
+                    `).join('');
+                }}
+
+                let provPillsHtml = prio.map((p, pIdx) => `
+                    <div class="prov-pill" style="font-size: 11px; padding: 2px 6px;">
+                        <span style="color: #38bdf8;">${{p}}</span>
+                        <button class="action-btn btn-secondary" style="padding: 0 4px; font-size: 9px;" ${{pIdx === 0 ? 'disabled style="opacity:0.3;"' : ''}} onclick="moveAliasProvider('${{aname}}', ${{pIdx}}, ${{pIdx - 1}})">&#8592;</button>
+                        <button class="action-btn btn-secondary" style="padding: 0 4px; font-size: 9px;" ${{pIdx === prio.length - 1 ? 'disabled style="opacity:0.3;"' : ''}} onclick="moveAliasProvider('${{aname}}', ${{pIdx}}, ${{pIdx + 1}})">&#8594;</button>
+                    </div>
+                `).join('');
+
+                let badgesHtml = '';
+                if (acfg.require_tools) badgesHtml += '<span class="badge-tag tag-tools">require tools</span>';
+                if (acfg.require_vision) badgesHtml += '<span class="badge-tag tag-vision">require vision</span>';
+                (acfg.prefer_tags || []).forEach(pt => {{
+                    badgesHtml += `<span class="badge-tag tag-${{pt}}">${{pt}}</span>`;
+                }});
+
+                html += `
+                <div class="alias-card">
+                    <div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <strong style="font-size: 15px; color: #38bdf8;">${{aname}}</strong>
+                            <div>${{badgesHtml}}</div>
+                        </div>
+                        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 10px;">${{acfg.description || ''}}</div>
+
+                        <div style="margin-bottom: 10px;">
+                            <div style="font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 600; margin-bottom: 6px;">
+                                Цепочка приоритета моделей:
+                            </div>
+                            ${{modelsListHtml}}
+                        </div>
+
+                        <div style="display: flex; gap: 6px; margin-bottom: 12px;">
+                            <input type="text" id="add-model-input-${{aname}}" placeholder="Имя модели для добавления..." class="admin-input" style="flex: 1; font-size: 12px; padding: 6px 10px;">
+                            <button class="action-btn" style="background: #059669; padding: 6px 12px; font-size: 12px;" onclick="addModelToAlias('${{aname}}')">+ Добавить</button>
+                        </div>
+                    </div>
+
+                    <div style="border-top: 1px solid #334155; padding-top: 10px; margin-top: 6px;">
+                        <div style="font-size: 11px; color: #64748b; margin-bottom: 4px;">Приоритет провайдеров для алиаса:</div>
+                        <div style="display: flex; gap: 4px; flex-wrap: wrap;">${{provPillsHtml}}</div>
+                    </div>
+                </div>
+                `;
+            }}
+
+            container.innerHTML = html;
+        }}
+
+        function moveModelInAlias(aname, fromIdx, toIdx) {{
+            if (!activeCatalogData || !activeCatalogData.aliases[aname]) return;
+            const arr = activeCatalogData.aliases[aname].models;
+            if (toIdx < 0 || toIdx >= arr.length) return;
+            const tmp = arr[fromIdx];
+            arr[fromIdx] = arr[toIdx];
+            arr[toIdx] = tmp;
+            renderAliasesPriorityGrid();
+        }}
+
+        function removeModelFromAlias(aname, idx) {{
+            if (!activeCatalogData || !activeCatalogData.aliases[aname]) return;
+            activeCatalogData.aliases[aname].models.splice(idx, 1);
+            renderAliasesPriorityGrid();
+        }}
+
+        function addModelToAlias(aname) {{
+            const input = document.getElementById('add-model-input-' + aname);
+            if (!input || !input.value.trim()) return;
+            const mid = input.value.trim();
+            if (!activeCatalogData || !activeCatalogData.aliases[aname]) return;
+            if (!activeCatalogData.aliases[aname].models) activeCatalogData.aliases[aname].models = [];
+            activeCatalogData.aliases[aname].models.push(mid);
+            input.value = '';
+            renderAliasesPriorityGrid();
+        }}
+
+        function addModelToAliasFromCatalog(aname, modelId) {{
+            if (!activeCatalogData || !activeCatalogData.aliases[aname]) return;
+            if (!activeCatalogData.aliases[aname].models) activeCatalogData.aliases[aname].models = [];
+            if (!activeCatalogData.aliases[aname].models.includes(modelId)) {{
+                activeCatalogData.aliases[aname].models.push(modelId);
+                renderAliasesPriorityGrid();
+                alert('✓ Модель \"' + modelId + '\" добавлена в алиас ' + aname + '! Не забудьте нажать «Сохранить приоритеты».');
+            }} else {{
+                alert('Модель \"' + modelId + '\" уже есть в алиасе ' + aname);
+            }}
+        }}
+
+        function moveAliasProvider(aname, fromIdx, toIdx) {{
+            if (!activeCatalogData || !activeCatalogData.aliases[aname]) return;
+            const arr = activeCatalogData.aliases[aname].provider_priority;
+            if (toIdx < 0 || toIdx >= arr.length) return;
+            const tmp = arr[fromIdx];
+            arr[fromIdx] = arr[toIdx];
+            arr[toIdx] = tmp;
+            renderAliasesPriorityGrid();
+        }}
+
+        function filterCatalogTable() {{
+            const tbody = document.getElementById('tbody-catalog-models');
+            const countInfo = document.getElementById('catalog-count-info');
+            if (!tbody || !activeCatalogData) return;
+
+            const q = (document.getElementById('model-filter-text') ? document.getElementById('model-filter-text').value : '').toLowerCase().trim();
+            const filterProv = (document.getElementById('model-filter-prov') ? document.getElementById('model-filter-prov').value : '').toLowerCase().trim();
+            const filterTag = (document.getElementById('model-filter-tag') ? document.getElementById('model-filter-tag').value : '').toLowerCase().trim();
+
+            const allList = [];
+            if (activeCatalogData.local_model) {{
+                allList.push({{
+                    id: activeCatalogData.local_model,
+                    canonical: activeCatalogData.local_model,
+                    provider: 'local',
+                    context_length: 262144,
+                    tags: ['coding', 'tools', 'smart', 'local']
+                }});
+            }}
+
+            const provModels = activeCatalogData.providers_models || {{}};
+            for (const [pid, mlist] of Object.entries(provModels)) {{
+                for (const m of mlist) {{
+                    allList.push({{
+                        id: m.id,
+                        canonical: m.canonical || m.id,
+                        provider: pid,
+                        context_length: m.context_length || 32768,
+                        tags: m.tags || []
+                    }});
+                }}
+            }}
+
+            const filtered = allList.filter(m => {{
+                if (filterProv && m.provider.toLowerCase() !== filterProv) return false;
+                if (filterTag && !m.tags.includes(filterTag)) return false;
+                if (q) {{
+                    const matchId = m.id.toLowerCase().includes(q);
+                    const matchCanon = m.canonical.toLowerCase().includes(q);
+                    const matchProv = m.provider.toLowerCase().includes(q);
+                    const matchTags = m.tags.some(t => t.toLowerCase().includes(q));
+                    if (!matchId && !matchCanon && !matchProv && !matchTags) return false;
+                }}
+                return true;
+            }});
+
+            if (filtered.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #64748b; padding: 20px;">Модели не найдены. Нажмите «Собрать модели со всех ключей».</td></tr>';
+            }} else {{
+                tbody.innerHTML = filtered.map(m => {{
+                    const ctxStr = m.context_length ? Math.round(m.context_length / 1024) + 'k' : '-';
+                    const tagsHtml = (m.tags || []).map(t => `<span class="badge-tag tag-${{t}}">${{t}}</span>`).join('');
+                    const aliasOptions = Object.keys(activeCatalogData.aliases || {{}}).map(a => `<option value="${{a}}">${{a}}</option>`).join('');
+
+                    return `
+                    <tr>
+                        <td style="font-family: monospace; font-weight: 600; color: #f8fafc;">${{m.id}}</td>
+                        <td style="font-family: monospace; color: #94a3b8; font-size: 12px;">${{m.canonical}}</td>
+                        <td><span style="font-weight: 600; color: #38bdf8; background: #0f172a; border: 1px solid #334155; padding: 2px 7px; border-radius: 4px; font-size: 11px;">${{m.provider}}</span></td>
+                        <td><span class="badge-temp badge-green" style="font-size: 11px; padding: 2px 6px;">${{ctxStr}}</span></td>
+                        <td>${{tagsHtml}}</td>
+                        <td style="text-align: right;">
+                            <select class="admin-input" style="padding: 4px 8px; font-size: 11px; width: auto;" onchange="if(this.value){{ addModelToAliasFromCatalog(this.value, '${{m.id}}'); this.value=''; }}">
+                                <option value="">+ В алиас...</option>
+                                ${{aliasOptions}}
+                            </select>
+                        </td>
+                    </tr>
+                    `;
+                }}).join('');
+            }}
+
+            if (countInfo) {{
+                countInfo.innerText = `Найдено моделей: ${{filtered.length}} из ${{allList.length}}`;
+            }}
+        }}
+
+        async function saveAllPriorities() {{
+            const token = getAuthToken();
+            if (!token) return;
+            const selMode = document.getElementById('sel-model-mode');
+            const mode = selMode ? selMode.value : 'user_first';
+
+            const payload = {{
+                model_selection_mode: mode,
+                provider_priority: (activeCatalogData && activeCatalogData.routing) ? activeCatalogData.routing.provider_priority : null,
+                aliases: (activeCatalogData && activeCatalogData.aliases) ? activeCatalogData.aliases : null,
+            }};
+
+            try {{
+                const res = await fetch('/v1/admin/save-priorities', {{
+                    method: 'POST',
+                    headers: {{
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify(payload)
+                }});
+                const data = await res.json();
+                if (res.ok) {{
+                    alert('✓ Приоритеты и алиасы успешно сохранены в config.yaml!');
+                    loadModelsCatalog();
+                }} else {{
+                    alert('Ошибка при сохранении: ' + (data.detail || JSON.stringify(data)));
+                }}
+            }} catch (e) {{
+                alert('Ошибка сети: ' + e);
+            }}
+        }}
+
+        async function fetchAllCloudModels() {{
+            const token = getAuthToken();
+            if (!token) return;
+            try {{
+                const res = await fetch('/v1/admin/fetch-models', {{
+                    method: 'POST',
+                    headers: {{
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify({{ provider_id: 'all' }})
+                }});
+                const data = await res.json();
+                if (res.ok) {{
+                    alert('✓ Модели со всех активных ключей успешно собраны и обновлены в каталоге!');
+                    loadModelsCatalog();
+                }} else {{
+                    alert('Ошибка: ' + (data.detail || JSON.stringify(data)));
+                }}
+            }} catch (e) {{
+                alert('Ошибка сети: ' + e);
+            }}
+        }}
+
+        async function fetchSelectedProviderModels() {{
+            const sel = document.getElementById('fetch-prov-select');
+            if (!sel || !sel.value) return;
+            const pid = sel.value;
+            await fetchModelsForProvider(pid);
+            loadModelsCatalog();
+        }}
+
+        async function fetchModelsForProvider(pid) {{
+            const token = getAuthToken();
+            if (!token) return;
+            try {{
+                const res = await fetch('/v1/admin/fetch-models', {{
+                    method: 'POST',
+                    headers: {{
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify({{ provider_id: pid }})
+                }});
+                const data = await res.json();
+                if (res.ok) {{
+                    alert(`✓ С провайдера ${{data.provider_id}} успешно получено моделей: ${{data.count}}! Они добавлены в каталог на вкладке «Модели и Приоритеты».`);
+                }} else {{
+                    alert('Ошибка: ' + (data.detail || JSON.stringify(data)));
+                }}
+            }} catch (e) {{
+                alert('Ошибка сети: ' + e);
+            }}
         }}
 
         let activeKeysConfig = null;
@@ -1251,6 +1858,7 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
                             <label style="font-size: 12px; color: #e2e8f0; display: flex; align-items: center; gap: 6px; cursor: pointer;">
                                 <input type="checkbox" id="prov-proxy-${{pid}}" ${{useProxy ? 'checked' : ''}} style="cursor: pointer;"> Прокси
                             </label>
+                            <button class="action-btn" style="background: #0284c7; padding: 5px 10px; font-size: 12px;" onclick="fetchModelsForProvider('${{pid}}')">&#128229; Получить модели</button>
                             <button class="action-btn btn-danger" style="padding: 5px 10px; font-size: 12px;" onclick="deleteProvider('${{pid}}')">&#128465; Удалить</button>
                         </div>
                     </div>
@@ -1520,8 +2128,9 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
 
         // Живое фоновое обновление метрик без полной перезагрузки страницы (AJAX)
         async function refreshDashboardMetrics() {{
-            // Если открыта вкладка ключей, не трогаем DOM, чтобы не сбивать фокус ввода
-            if (localStorage.getItem('active_tab') === 'keys') return;
+            // Если открыта вкладка ключей или моделей, не трогаем DOM, чтобы не сбивать фокус ввода и действия пользователя
+            const activeTab = localStorage.getItem('active_tab');
+            if (activeTab === 'keys' || activeTab === 'models') return;
 
             try {{
                 const res = await fetch('/health', {{ headers: {{ 'Accept': 'application/json' }} }});

@@ -302,6 +302,91 @@ def test_admin_and_keys_management():
         assert prov_id not in cfg_after.providers
 
 
+def test_models_catalog_and_priorities_management():
+    with TestClient(app) as client:
+        secrets = config_loader.get_secrets()
+        auth_header = {"Authorization": f"Bearer {secrets.gateway_api_key}"}
+
+        # 1. Models catalog without auth -> 401
+        assert client.get("/v1/admin/models-catalog").status_code == 401
+
+        # 2. Models catalog with auth -> 200
+        res_cat = client.get("/v1/admin/models-catalog", headers=auth_header)
+        assert res_cat.status_code == 200
+        cat_data = res_cat.json()
+        assert "aliases" in cat_data
+        assert "routing" in cat_data
+        assert "provider_priority" in cat_data["routing"]
+        assert "model_selection_mode" in cat_data["routing"]
+        assert "providers_models" in cat_data
+        assert "providers" in cat_data
+        assert "auto-executor" in cat_data["aliases"]
+        assert isinstance(cat_data["routing"]["provider_priority"], list)
+
+        # 3. Fetch models from provider endpoint without auth -> 401
+        assert client.post("/v1/admin/fetch-models", json={"provider_id": "cerebras"}).status_code == 401
+
+        # 4. Fetch models with auth for non-existent provider -> returns 404
+        res_fetch_none = client.post("/v1/admin/fetch-models", json={"provider_id": "non_existent_provider"}, headers=auth_header)
+        assert res_fetch_none.status_code == 404
+
+        # 5. Fetch models with explicit key for provider
+        res_fetch_cerebras = client.post(
+            "/v1/admin/fetch-models",
+            json={"provider_id": "cerebras", "key": "csk-mock-key-123"},
+            headers=auth_header,
+        )
+        assert res_fetch_cerebras.status_code == 200
+        fetch_res = res_fetch_cerebras.json()
+        assert fetch_res["provider_id"] == "cerebras"
+        assert "count" in fetch_res
+        assert "models" in fetch_res
+
+        # 6. Save priorities and aliases without auth -> 401
+        assert client.post("/v1/admin/save-priorities", json={}).status_code == 401
+
+        # 7. Save priorities and aliases with auth
+        orig_cfg = config_loader.get_config()
+        orig_aliases = {k: v.model_dump() if hasattr(v, "model_dump") else (v.dict() if hasattr(v, "dict") else dict(v)) for k, v in orig_cfg.aliases.items()}
+        orig_prov_prio = list(orig_cfg.routing.provider_priority)
+        orig_mode = orig_cfg.routing.model_selection_mode
+
+        test_aliases = dict(orig_aliases)
+        test_prov_prio = ["cerebras", "local", "groq", "sambanova", "glhf", "mistral", "gemini", "openrouter"]
+        test_mode = "user_only"
+
+        res_save = client.post(
+            "/v1/admin/save-priorities",
+            json={
+                "aliases": test_aliases,
+                "provider_priority": test_prov_prio,
+                "model_selection_mode": test_mode,
+            },
+            headers=auth_header,
+        )
+        assert res_save.status_code == 200
+        assert res_save.json()["status"] == "ok"
+
+        # Verify in-memory config updated
+        updated_cfg = config_loader.get_config()
+        assert updated_cfg.routing.model_selection_mode == "user_only"
+        assert updated_cfg.routing.provider_priority == test_prov_prio
+
+        # Revert back to original configuration to keep workspace clean
+        client.post(
+            "/v1/admin/save-priorities",
+            json={
+                "aliases": orig_aliases,
+                "provider_priority": orig_prov_prio,
+                "model_selection_mode": orig_mode,
+            },
+            headers=auth_header,
+        )
+        reverted_cfg = config_loader.get_config()
+        assert reverted_cfg.routing.model_selection_mode == orig_mode
+        assert reverted_cfg.routing.provider_priority == orig_prov_prio
+
+
 if __name__ == "__main__":
     print("Running tests...")
     test_config_loader()
@@ -320,4 +405,6 @@ if __name__ == "__main__":
     print("✓ API Endpoints & Health Dashboard OK")
     test_admin_and_keys_management()
     print("✓ Admin & Keys/Providers Management OK")
-    print("\nALL 8 TEST SUITES PASSED SUCCESSFULLY!")
+    test_models_catalog_and_priorities_management()
+    print("✓ Models Catalog & Priorities Management OK")
+    print("\nALL 9 TEST SUITES PASSED SUCCESSFULLY!")

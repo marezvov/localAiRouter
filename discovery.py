@@ -291,9 +291,14 @@ class ModelDiscovery:
                         m["context_tier"] = self._get_context_tier(m["context_length"])
                     m["llm_classified"] = True
 
-    async def fetch_provider_models(self, pid: str, pcfg: ProviderConfig) -> List[Dict[str, Any]]:
+    async def fetch_provider_models(
+        self,
+        pid: str,
+        pcfg: ProviderConfig,
+        explicit_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Запрашивает список моделей у провайдера с извлечением метаданных."""
-        key = await self.key_manager.get_active_key(pid)
+        key = explicit_key or await self.key_manager.get_active_key(pid)
         static_models = {m.id: m for m in pcfg.models}
         cached_models = {
             m["id"]: m
@@ -318,6 +323,9 @@ class ModelDiscovery:
             }
 
         if not key:
+            if "providers" not in self._cache:
+                self._cache["providers"] = {}
+            self._cache["providers"][pid] = list(result_models.values())
             return list(result_models.values())
 
         # 2. Динамический опрос /v1/models
@@ -382,7 +390,14 @@ class ModelDiscovery:
         except Exception as e:
             logger.warning(f"Could not discover models from {pid}: {e}")
 
-        return list(result_models.values())
+        models_list = list(result_models.values())
+        if "providers" not in self._cache:
+            self._cache["providers"] = {}
+        self._cache["providers"][pid] = models_list
+        self._cache["updated_at"] = time.time()
+        self._save_cache()
+
+        return models_list
 
     def find_providers_for_model(
         self,

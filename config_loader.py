@@ -274,3 +274,45 @@ def save_provider_to_config(provider_id: str, provider_dict: Dict[str, Any], rem
         yaml.dump(data, f, allow_unicode=True, sort_keys=False)
     temp_path.replace(CONFIG_PATH)
 
+
+def save_priorities_and_aliases_to_config(
+    aliases: Optional[Dict[str, Any]] = None,
+    provider_priority: Optional[List[str]] = None,
+    model_selection_mode: Optional[str] = None,
+) -> None:
+    """
+    Атомарно сохраняет измененные алиасы, глобальные приоритеты поставщиков и режим выбора моделей в config.yaml.
+    """
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Config file not found at {CONFIG_PATH}")
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if aliases is not None:
+        if "aliases" not in data or not isinstance(data["aliases"], dict):
+            data["aliases"] = {}
+        for aname, acfg in aliases.items():
+            if isinstance(acfg, dict):
+                if aname not in data["aliases"]:
+                    data["aliases"][aname] = {}
+                for k, v in acfg.items():
+                    data["aliases"][aname][k] = v
+            else:
+                data["aliases"][aname] = acfg
+
+    if "routing" not in data or not isinstance(data["routing"], dict):
+        data["routing"] = {}
+
+    if provider_priority is not None:
+        data["routing"]["provider_priority"] = provider_priority
+
+    if model_selection_mode is not None:
+        data["routing"]["model_selection_mode"] = model_selection_mode
+
+    temp_path = CONFIG_PATH.with_suffix(".tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+    temp_path.replace(CONFIG_PATH)
+
+

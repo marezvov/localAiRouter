@@ -97,6 +97,9 @@ aliases:
     default_sampling:
       temperature: 0.6
       top_p: 0.95
+    priority: []
+    require_tools: false
+    require_vision: false
   auto-executor:
     description: 'Primary coding executor: local Qwen 35B with cloud coding fallback'
     models:
@@ -115,12 +118,19 @@ aliases:
     default_sampling:
       temperature: 0.2
       top_p: 0.95
+    priority: []
+    require_vision: false
   local-only:
     description: Strictly local Qwen3.6 execution with KV-cache reuse
     models:
     - Qwen3.6-35B-A3B
     provider_priority:
     - local
+    priority: []
+    require_tools: false
+    require_vision: false
+    prefer_tags: []
+    default_sampling: {}
   auto-fast:
     description: Ultra-fast response for small tasks
     models:
@@ -132,6 +142,10 @@ aliases:
     - local
     prefer_tags:
     - fast
+    priority: []
+    require_tools: false
+    require_vision: false
+    default_sampling: {}
   auto-vision:
     description: Multimodal tasks with image preprocessing
     provider_priority:
@@ -139,6 +153,11 @@ aliases:
     - groq
     - local
     require_vision: true
+    models: []
+    priority: []
+    require_tools: false
+    prefer_tags: []
+    default_sampling: {}
 image_processing:
   enabled: true
   local:
