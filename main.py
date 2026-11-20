@@ -806,7 +806,7 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
                 <span>&#9889;</span> AI Gateway Dashboard
             </div>
             <div style="display: flex; gap: 8px;">
-                <div class="badge">Uptime: <strong>{uptime_str}</strong></div>
+                <div class="badge">Uptime: <strong id="val-uptime">{uptime_str}</strong></div>
                 <div class="badge">Port: <strong>{cfg.server.port}</strong></div>
             </div>
         </div>
@@ -835,26 +835,26 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
             <div class="grid">
                 <div class="card">
                     <div class="card-title">Local Inference Node</div>
-                    <div class="card-val" style="color: {'#10b981' if loc_online else '#ef4444'};">
+                    <div id="val-loc-status" class="card-val" style="color: {'#10b981' if loc_online else '#ef4444'};">
                         {('ONLINE' if loc_online else 'OFFLINE')}
                     </div>
-                    <div class="card-sub">{cfg.local_backend.model_name} ({host_hw_str})</div>
+                    <div id="val-loc-sub" class="card-sub">{cfg.local_backend.model_name} ({host_hw_str})</div>
                 </div>
                 <div class="card">
                     <div class="card-title">Slot 0 State</div>
-                    <div class="card-val" style="color: {'#f59e0b' if loc_occupied else '#10b981'};">
+                    <div id="val-slot-status" class="card-val" style="color: {'#f59e0b' if loc_occupied else '#10b981'};">
                         {('BUSY (Generating)' if loc_occupied else 'IDLE (Ready)')}
                     </div>
-                    <div class="card-sub">Queue Waiters: {loc_queue}</div>
+                    <div id="val-slot-queue" class="card-sub">Queue Waiters: {loc_queue}</div>
                 </div>
                 <div class="card">
                     <div class="card-title">KV-Cache & Speed</div>
-                    <div class="card-val">{loc_n_past:,} <span style="font-size: 15px; font-weight: normal; color: #94a3b8;">tokens</span></div>
-                    <div class="card-sub">Generation Speed: {loc_ts} t/s</div>
+                    <div id="val-loc-npast" class="card-val">{loc_n_past:,} <span style="font-size: 15px; font-weight: normal; color: #94a3b8;">tokens</span></div>
+                    <div id="val-loc-speed" class="card-sub">Generation Speed: {loc_ts} t/s</div>
                 </div>
                 <div class="card">
                     <div class="card-title">Active Agent Sessions</div>
-                    <div class="card-val">{len(data.get('active_sessions', []))}</div>
+                    <div id="val-sess-count" class="card-val">{len(data.get('active_sessions', []))}</div>
                     <div class="card-sub">In-Memory Sticky Routing</div>
                 </div>
             </div>
@@ -871,7 +871,7 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
                             <th>Failures</th>
                         </tr>
                     </thead>
-                    <tbody>
+                    <tbody id="tbody-keys">
                         {keys_html}
                     </tbody>
                 </table>
@@ -889,7 +889,7 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
                             <th>Total Req</th>
                         </tr>
                     </thead>
-                    <tbody>
+                    <tbody id="tbody-sessions">
                         {sess_html}
                     </tbody>
                 </table>
@@ -900,6 +900,87 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
                 <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 10px;">
                     {aliases_html}
                 </div>
+            </div>
+        </div>
+
+        <!-- TAB 2: SYSTEM & TEMPERATURES -->
+        <div id="tab-system" class="tab-pane" style="display: none;">
+            <div class="grid">
+                <div class="card">
+                    <div class="card-title" title="{cpu_model}">CPU ({cpu_short or cpu_model})</div>
+                    <div id="val-cpu-pct" class="card-val" style="color: {cpu_color};">{cpu_pct}%</div>
+                    <div class="progress-bg">
+                        <div id="bar-cpu-pct" class="progress-bar" style="width: {cpu_pct}%; background: {cpu_color};"></div>
+                    </div>
+                    <div id="sub-cpu-info" class="card-sub">{cpu_cores_str} {f'| {cpu_freq_str}' if cpu_freq_str else ''} {cpu_temp_badge}</div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">System RAM Memory</div>
+                    <div id="val-ram-used" class="card-val">{ram_used} / {ram_total} GB</div>
+                    <div class="progress-bg">
+                        <div id="bar-ram-pct" class="progress-bar" style="width: {ram_pct}%; background: {ram_color};"></div>
+                    </div>
+                    <div id="sub-ram-info" class="card-sub">{ram_pct}% used (Free: {ram_avail} GB){swap_sub}</div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">GPU: {gpu_name}</div>
+                    <div id="val-gpu-pct" class="card-val" style="color: {'#10b981' if gpu_avail else '#64748b'};">
+                        {f'{gpu_pct}%' if (gpu_avail and gpu_pct > 0) else ('ACTIVE' if gpu_avail else 'N/A')}
+                    </div>
+                    <div class="progress-bg">
+                        <div id="bar-vram-pct" class="progress-bar" style="width: {vram_pct}%; background: {vram_color};"></div>
+                    </div>
+                    <div id="sub-gpu-info" class="card-sub">
+                        {f'VRAM: {vram_used}/{vram_total} GB ({vram_pct}%)' if (gpu_avail and vram_total > 0) else gpu_name}
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Disk Storage ({disk_path})</div>
+                    <div id="val-disk-used" class="card-val">{disk_used} / {disk_total} GB</div>
+                    <div class="progress-bg">
+                        <div id="bar-disk-pct" class="progress-bar" style="width: {disk_pct}%; background: {disk_color};"></div>
+                    </div>
+                    <div id="sub-disk-info" class="card-sub">{disk_pct}% used (Free: {disk_free} GB)</div>
+                </div>
+            </div>
+
+            <!-- CPU PER-CORE LOAD -->
+            <div class="table-card">
+                <h3>&#9881; CPU Per-Core Load ({cpu_cores_str})</h3>
+                <div id="grid-cores" class="cores-grid">
+                    {cores_html}
+                </div>
+            </div>
+
+            <!-- GPU DETAILS -->
+            <div class="table-card">
+                <h3>&#127918; Hardware Accelerator Details ({gpu_name})</h3>
+                <div id="grid-gpu-stats" class="gpu-stat-grid">
+                    {gpu_boxes_html}
+                </div>
+            </div>
+
+            <!-- TEMPERATURES TABLE -->
+            <div class="table-card">
+                <h3>&#127777; Hardware Thermal Sensors (Все аппаратные термодатчики)</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Chip / Device</th>
+                            <th>Sensor Zone / Rail</th>
+                            <th>Current Temp</th>
+                            <th>High Threshold</th>
+                            <th>Critical Threshold</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tbody-temps">
+                        {temps_html}
+                    </tbody>
+                </table>
             </div>
         </div>
 
@@ -1437,132 +1518,214 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
         const savedTab = localStorage.getItem('active_tab') || 'gateway';
         switchTab(savedTab);
 
-        // Автообновление каждые 10 секунд (пропускаем если открыта вкладка ключей)
-        setTimeout(() => {{
-            if (localStorage.getItem('active_tab') !== 'keys') {{
-                location.reload();
-            }}
-        }}, 10000);
-    </script>
-</body>
-</html>
-        <div id="tab-system" class="tab-pane" style="display: none;">
-            <div class="grid">
-                <div class="card">
-                    <div class="card-title" title="{cpu_model}">CPU ({cpu_short or cpu_model})</div>
-                    <div class="card-val" style="color: {cpu_color};">{cpu_pct}%</div>
-                    <div class="progress-bg">
-                        <div class="progress-bar" style="width: {cpu_pct}%; background: {cpu_color};"></div>
-                    </div>
-                    <div class="card-sub">{cpu_cores_str} {f'| {cpu_freq_str}' if cpu_freq_str else ''} {cpu_temp_badge}</div>
-                </div>
+        // Живое фоновое обновление метрик без полной перезагрузки страницы (AJAX)
+        async function refreshDashboardMetrics() {{
+            // Если открыта вкладка ключей, не трогаем DOM, чтобы не сбивать фокус ввода
+            if (localStorage.getItem('active_tab') === 'keys') return;
 
-                <div class="card">
-                    <div class="card-title">System RAM Memory</div>
-                    <div class="card-val">{ram_used} / {ram_total} GB</div>
-                    <div class="progress-bg">
-                        <div class="progress-bar" style="width: {ram_pct}%; background: {ram_color};"></div>
-                    </div>
-                    <div class="card-sub">{ram_pct}% used (Free: {ram_avail} GB){swap_sub}</div>
-                </div>
-
-                <div class="card">
-                    <div class="card-title">GPU: {gpu_name}</div>
-                    <div class="card-val" style="color: {'#10b981' if gpu_avail else '#64748b'};">
-                        {f'{gpu_pct}%' if (gpu_avail and gpu_pct > 0) else ('ACTIVE' if gpu_avail else 'N/A')}
-                    </div>
-                    <div class="progress-bg">
-                        <div class="progress-bar" style="width: {vram_pct}%; background: {vram_color};"></div>
-                    </div>
-                    <div class="card-sub">
-                        {f'VRAM: {vram_used}/{vram_total} GB ({vram_pct}%)' if (gpu_avail and vram_total > 0) else gpu_name}
-                    </div>
-                </div>
-
-                <div class="card">
-                    <div class="card-title">Disk Storage ({disk_path})</div>
-                    <div class="card-val">{disk_used} / {disk_total} GB</div>
-                    <div class="progress-bg">
-                        <div class="progress-bar" style="width: {disk_pct}%; background: {disk_color};"></div>
-                    </div>
-                    <div class="card-sub">{disk_pct}% used (Free: {disk_free} GB)</div>
-                </div>
-            </div>
-
-            <!-- CPU PER-CORE LOAD -->
-            <div class="table-card">
-                <h3>&#9881; CPU Per-Core Load ({cpu_cores_str})</h3>
-                <div class="cores-grid">
-                    {cores_html}
-                </div>
-            </div>
-
-            <!-- GPU DETAILS -->
-            <div class="table-card">
-                <h3>&#127918; Hardware Accelerator Details ({gpu_name})</h3>
-                <div class="gpu-stat-grid">
-                    {gpu_boxes_html}
-                </div>
-            </div>
-
-            <!-- TEMPERATURES TABLE -->
-            <div class="table-card">
-                <h3>&#127777; Hardware Thermal Sensors (Все аппаратные термодатчики)</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Chip / Device</th>
-                            <th>Sensor Zone / Rail</th>
-                            <th>Current Temp</th>
-                            <th>High Threshold</th>
-                            <th>Critical Threshold</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {temps_html}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        function switchTab(tabId) {{
             try {{
-                localStorage.setItem('active_tab', tabId);
-            }} catch(e) {{}}
-            document.querySelectorAll('.tab-pane').forEach(el => el.style.display = 'none');
-            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+                const res = await fetch('/health', {{ headers: {{ 'Accept': 'application/json' }} }});
+                if (!res.ok) return;
+                const d = await res.json();
 
-            const pane = document.getElementById('tab-' + tabId);
-            const btn = document.getElementById('btn-tab-' + tabId);
-            if (pane) pane.style.display = 'block';
-            if (btn) btn.classList.add('active');
-        }}
+                // 1. Uptime
+                if (d.uptime_sec !== undefined) {{
+                    const u = d.uptime_sec;
+                    const uStr = Math.floor(u / 3600) + 'h ' + Math.floor((u % 3600) / 60) + 'm ' + Math.floor(u % 60) + 's';
+                    const elUptime = document.getElementById('val-uptime');
+                    if (elUptime) elUptime.innerText = uStr;
+                }}
 
-        // Восстановление активной вкладки после автообновления
-        const savedTab = localStorage.getItem('active_tab') || 'gateway';
-        switchTab(savedTab);
+                // 2. Tab 1 - Gateway & Inference
+                const loc = d.local_backend || {{}};
+                const elLocStatus = document.getElementById('val-loc-status');
+                if (elLocStatus) {{
+                    elLocStatus.innerText = loc.online ? 'ONLINE' : 'OFFLINE';
+                    elLocStatus.style.color = loc.online ? '#10b981' : '#ef4444';
+                }}
+                const elSlotStatus = document.getElementById('val-slot-status');
+                if (elSlotStatus) {{
+                    elSlotStatus.innerText = loc.slot_occupied ? 'BUSY (Generating)' : 'IDLE (Ready)';
+                    elSlotStatus.style.color = loc.slot_occupied ? '#f59e0b' : '#10b981';
+                }}
+                const elSlotQueue = document.getElementById('val-slot-queue');
+                if (elSlotQueue) {{
+                    elSlotQueue.innerText = 'Queue Waiters: ' + (loc.queue_length || 0);
+                }}
+                const elLocNpast = document.getElementById('val-loc-npast');
+                if (elLocNpast) {{
+                    elLocNpast.innerHTML = (loc.n_past || 0).toLocaleString() + ' <span style="font-size: 15px; font-weight: normal; color: #94a3b8;">tokens</span>';
+                }}
+                const elLocSpeed = document.getElementById('val-loc-speed');
+                if (elLocSpeed) {{
+                    elLocSpeed.innerText = 'Generation Speed: ' + (loc.tokens_per_sec || 0) + ' t/s';
+                }}
+                const elSessCount = document.getElementById('val-sess-count');
+                if (elSessCount) {{
+                    elSessCount.innerText = (d.active_sessions || []).length;
+                }}
 
-        async function apiAction(endpoint, name) {{
-            const key = prompt("Enter Gateway Master API Key for authorization:", "{master_key}");
-            if (!key) return;
-            try {{
-                const res = await fetch(endpoint, {{
-                    method: 'POST',
-                    headers: {{ 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' }}
-                }});
-                const json = await res.json();
-                alert(name + " result: " + JSON.stringify(json, null, 2));
-                location.reload();
+                // 3. Tab 1 - Sessions Table
+                const tbodySess = document.getElementById('tbody-sessions');
+                if (tbodySess && d.active_sessions) {{
+                    if (d.active_sessions.length === 0) {{
+                        tbodySess.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #6b7280;">No active agent sessions</td></tr>';
+                    }} else {{
+                        let html = '';
+                        for (const s of d.active_sessions) {{
+                            const badge = s.is_holding_local_slot
+                                ? '<span style="color: #10b981; font-weight: bold;">● Active Slot</span>'
+                                : '<span style="color: #6b7280;">○ Idle</span>';
+                            html += `<tr>
+                                <td style="font-family: monospace; color: #a78bfa;">${{s.session_id}}</td>
+                                <td>${{s.active_provider}} / <span style="color: #60a5fa;">${{s.active_model}}</span></td>
+                                <td>${{badge}}</td>
+                                <td>${{s.idle_sec}}s ago</td>
+                                <td>${{s.total_requests}}</td>
+                            </tr>`;
+                        }}
+                        tbodySess.innerHTML = html;
+                    }}
+                }}
+
+                // 4. Tab 1 - Keys Table
+                const tbodyKeys = document.getElementById('tbody-keys');
+                if (tbodyKeys && d.providers_keys) {{
+                    let kHtml = '';
+                    for (const [pid, klist] of Object.entries(d.providers_keys)) {{
+                        for (const k of klist) {{
+                            const color = k.status === 'ACTIVE' ? '#10b981' : (k.status.includes('COOLDOWN') ? '#f59e0b' : '#ef4444');
+                            kHtml += `<tr>
+                                <td style="font-weight: 600; color: #93c5fd;">${{pid}}</td>
+                                <td style="font-family: monospace;">${{k.masked_key}}</td>
+                                <td><span style="background: ${{color}}22; color: ${{color}}; padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">${{k.status}}</span></td>
+                                <td>${{k.request_count}}</td>
+                                <td style="color: ${{k.fail_count > 0 ? '#ef4444' : '#9ca3af'}};">${{k.fail_count}}</td>
+                            </tr>`;
+                        }}
+                    }}
+                    if (kHtml) tbodyKeys.innerHTML = kHtml;
+                }}
+
+                // 5. Tab 2 - System Metrics
+                const sys = d.system || {{}};
+                const cpu = sys.cpu || {{}};
+                const mem = sys.memory || {{}};
+                const gpu = sys.gpu || {{}};
+                const disk = sys.disk || {{}};
+
+                // CPU
+                const cpuPct = cpu.overall_percent || 0;
+                const cpuColor = cpuPct < 60 ? '#10b981' : (cpuPct < 85 ? '#f59e0b' : '#ef4444');
+                const elCpuPct = document.getElementById('val-cpu-pct');
+                if (elCpuPct) {{ elCpuPct.innerText = cpuPct + '%'; elCpuPct.style.color = cpuColor; }}
+                const elCpuBar = document.getElementById('bar-cpu-pct');
+                if (elCpuBar) {{ elCpuBar.style.width = cpuPct + '%'; elCpuBar.style.background = cpuColor; }}
+                const elCpuSub = document.getElementById('sub-cpu-info');
+                if (elCpuSub) {{
+                    const freqStr = cpu.frequency_mhz ? ` | ${{Math.round(cpu.frequency_mhz)}} MHz` : '';
+                    const tempBadge = (cpu.temperature_c !== null && cpu.temperature_c !== undefined)
+                        ? `<span class="badge-temp badge-green" style="margin-left: 6px; font-size: 11px;">${{cpu.temperature_c}}°C</span>` : '';
+                    elCpuSub.innerHTML = `${{cpu.physical_cores || 1}}C / ${{cpu.logical_cores || 1}}T${{freqStr}} ${{tempBadge}}`;
+                }}
+
+                // Cores Grid
+                const gridCores = document.getElementById('grid-cores');
+                if (gridCores && cpu.per_core_percent) {{
+                    let cHtml = '';
+                    cpu.per_core_percent.forEach((cp, idx) => {{
+                        const cColor = cp < 60 ? '#10b981' : (cp < 85 ? '#f59e0b' : '#ef4444');
+                        cHtml += `<div class="core-box">
+                            <div style="display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                                <span>Core ${{idx}}</span>
+                                <span style="font-weight: 700; color: #f8fafc;">${{cp}}%</span>
+                            </div>
+                            <div class="progress-bg" style="height: 6px; margin-top: 0;">
+                                <div class="progress-bar" style="width: ${{cp}}%; background: ${{cColor}};"></div>
+                            </div>
+                        </div>`;
+                    }});
+                    if (cHtml) gridCores.innerHTML = cHtml;
+                }}
+
+                // RAM
+                const ramPct = mem.ram_percent || 0;
+                const ramColor = ramPct < 70 ? '#10b981' : (ramPct < 90 ? '#f59e0b' : '#ef4444');
+                const elRamVal = document.getElementById('val-ram-used');
+                if (elRamVal) elRamVal.innerText = `${{mem.ram_used_gb || 0}} / ${{mem.ram_total_gb || 0}} GB`;
+                const elRamBar = document.getElementById('bar-ram-pct');
+                if (elRamBar) {{ elRamBar.style.width = ramPct + '%'; elRamBar.style.background = ramColor; }}
+                const elRamSub = document.getElementById('sub-ram-info');
+                if (elRamSub) {{
+                    const swapStr = (mem.swap_total_gb > 0) ? ` | Swap: ${{mem.swap_used_gb}}/${{mem.swap_total_gb}} GB (${{mem.swap_percent}}%)` : '';
+                    elRamSub.innerText = `${{ramPct}}% used (Free: ${{mem.ram_available_gb || 0}} GB)${{swapStr}}`;
+                }}
+
+                // GPU
+                const elGpuVal = document.getElementById('val-gpu-pct');
+                const vramPct = gpu.vram_percent || 0;
+                const vramColor = vramPct < 70 ? '#10b981' : (vramPct < 90 ? '#f59e0b' : '#ef4444');
+                if (elGpuVal) {{
+                    if (gpu.available && gpu.gpu_percent > 0) {{
+                        elGpuVal.innerText = gpu.gpu_percent + '%';
+                        elGpuVal.style.color = '#10b981';
+                    }} else if (gpu.available) {{
+                        elGpuVal.innerText = 'ACTIVE';
+                        elGpuVal.style.color = '#10b981';
+                    }} else {{
+                        elGpuVal.innerText = 'N/A';
+                        elGpuVal.style.color = '#64748b';
+                    }}
+                }}
+                const elVramBar = document.getElementById('bar-vram-pct');
+                if (elVramBar) {{ elVramBar.style.width = vramPct + '%'; elVramBar.style.background = vramColor; }}
+                const elGpuSub = document.getElementById('sub-gpu-info');
+                if (elGpuSub) {{
+                    if (gpu.available && gpu.vram_total_gb > 0) {{
+                        elGpuSub.innerText = `VRAM: ${{gpu.vram_used_gb}}/${{gpu.vram_total_gb}} GB (${{vramPct}}%)`;
+                    }} else {{
+                        elGpuSub.innerText = gpu.name || 'No accelerator';
+                    }}
+                }}
+
+                // Disk
+                const diskPct = disk.percent || 0;
+                const diskColor = diskPct < 75 ? '#10b981' : (diskPct < 90 ? '#f59e0b' : '#ef4444');
+                const elDiskVal = document.getElementById('val-disk-used');
+                if (elDiskVal) elDiskVal.innerText = `${{disk.used_gb || 0}} / ${{disk.total_gb || 0}} GB`;
+                const elDiskBar = document.getElementById('bar-disk-pct');
+                if (elDiskBar) {{ elDiskBar.style.width = diskPct + '%'; elDiskBar.style.background = diskColor; }}
+                const elDiskSub = document.getElementById('sub-disk-info');
+                if (elDiskSub) elDiskSub.innerText = `${{diskPct}}% used (Free: ${{disk.free_gb || 0}} GB)`;
+
+                // Temperatures
+                const tbodyTemps = document.getElementById('tbody-temps');
+                if (tbodyTemps && sys.temperatures && sys.temperatures.length > 0) {{
+                    let tHtml = '';
+                    for (const t of sys.temperatures) {{
+                        const st = t.status || 'normal';
+                        const badgeCls = st === 'normal' ? 'badge-green' : (st === 'warning' ? 'badge-yellow' : 'badge-red');
+                        const hVal = t.high_c ? t.high_c + '°C' : '-';
+                        const crVal = t.critical_c ? t.critical_c + '°C' : '-';
+                        tHtml += `<tr>
+                            <td style="font-weight: 600; color: #93c5fd; font-family: monospace;">${{t.chip || ''}}</td>
+                            <td style="color: #e2e8f0;">${{t.label || ''}}</td>
+                            <td><span class="badge-temp ${{badgeCls}}">${{t.current_c}}°C</span></td>
+                            <td style="color: #94a3b8; font-family: monospace;">${{hVal}}</td>
+                            <td style="color: #ef4444; font-family: monospace;">${{crVal}}</td>
+                            <td><span class="badge-temp ${{badgeCls}}" style="font-size: 11px;">${{st.toUpperCase()}}</span></td>
+                        </tr>`;
+                    }}
+                    tbodyTemps.innerHTML = tHtml;
+                }}
+
             }} catch (e) {{
-                alert("Error: " + e);
+                console.warn('Dashboard live refresh error:', e);
             }}
         }}
 
-        // Автообновление каждые 10 секунд (сохраняет текущую вкладку в localStorage)
-        setTimeout(() => {{ location.reload(); }}, 10000);
+        // Живое обновление каждые 3 секунды
+        setInterval(refreshDashboardMetrics, 3000);
     </script>
 </body>
 </html>
