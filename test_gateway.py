@@ -142,6 +142,9 @@ def test_api_endpoints_with_test_client():
         assert "AI Gateway Dashboard" in resp_html.text
         assert "tab-gateway" in resp_html.text
         assert "tab-system" in resp_html.text
+        assert "tab-keys" in resp_html.text
+        assert "keys-auth-box" in resp_html.text
+        assert "modal-new-provider" in resp_html.text
         assert "switchTab" in resp_html.text
         assert "localStorage.getItem('active_tab')" in resp_html.text
 
@@ -223,6 +226,82 @@ def test_router_candidate_priority():
     assert "cerebras" in matched_providers or "groq" in matched_providers or "sambanova" in matched_providers
 
 
+def test_admin_and_keys_management():
+    with TestClient(app) as client:
+        secrets = config_loader.get_secrets()
+
+        # 1. Login with wrong password -> 401
+        res_fail = client.post("/v1/admin/login", json={"username": "admin", "password": "wrong_password"})
+        assert res_fail.status_code == 401
+
+        # 2. Login with correct password -> 200
+        res_ok = client.post("/v1/admin/login", json={"username": "admin", "password": secrets.gateway_api_key})
+        assert res_ok.status_code == 200
+        login_data = res_ok.json()
+        assert login_data["status"] == "ok"
+        assert "token" in login_data
+        session_token = login_data["token"]
+        session_auth_header = {"Authorization": f"Bearer {session_token}"}
+
+        # 3. GET /v1/admin/keys-config without auth -> 401
+        assert client.get("/v1/admin/keys-config").status_code == 401
+
+        # 4. GET /v1/admin/keys-config with auth -> 200
+        res_keys = client.get("/v1/admin/keys-config", headers=session_auth_header)
+        assert res_keys.status_code == 200
+        kdata = res_keys.json()
+        assert "providers" in kdata
+        assert "gateway_api_key" in kdata
+        assert "groq" in kdata["providers"]
+
+        # 5. POST /v1/admin/test-key validation (empty base_url or key -> 400)
+        res_test_invalid = client.post("/v1/admin/test-key", json={}, headers=session_auth_header)
+        assert res_test_invalid.status_code == 400
+
+        # 6. POST /v1/admin/save-keys (saving secrets and keys)
+        res_save_keys = client.post(
+            "/v1/admin/save-keys",
+            json={
+                "outbound_proxy": secrets.outbound_proxy or "",
+                "provider_keys": {},
+            },
+            headers=session_auth_header,
+        )
+        assert res_save_keys.status_code == 200
+
+        # 7. POST /v1/admin/save-provider (Add custom provider)
+        prov_id = "test_custom_prov"
+        add_payload = {
+            "action": "save",
+            "provider_id": prov_id,
+            "name": "Test Custom Provider",
+            "base_url": "https://api.testcustom.com/v1",
+            "api_key_env": "TEST_CUSTOM_API_KEY",
+            "keys": ["key_unit_test_123"],
+            "use_proxy": False,
+        }
+        res_add = client.post("/v1/admin/save-provider", json=add_payload, headers=session_auth_header)
+        assert res_add.status_code == 200
+        assert res_add.json()["status"] == "ok"
+
+        # Check config in-memory has the provider
+        cfg = config_loader.get_config()
+        assert prov_id in cfg.providers
+        assert cfg.providers[prov_id].base_url == "https://api.testcustom.com/v1"
+
+        # 8. POST /v1/admin/save-provider (Delete custom provider)
+        del_payload = {
+            "action": "delete",
+            "provider_id": prov_id,
+        }
+        res_del = client.post("/v1/admin/save-provider", json=del_payload, headers=session_auth_header)
+        assert res_del.status_code == 200
+        assert res_del.json()["status"] == "ok"
+
+        cfg_after = config_loader.get_config()
+        assert prov_id not in cfg_after.providers
+
+
 if __name__ == "__main__":
     print("Running tests...")
     test_config_loader()
@@ -239,4 +318,6 @@ if __name__ == "__main__":
     print("✓ Router Model-First, Unknown Models & Candidate Priority OK")
     test_api_endpoints_with_test_client()
     print("✓ API Endpoints & Health Dashboard OK")
-    print("\nALL 7 TEST SUITES PASSED SUCCESSFULLY!")
+    test_admin_and_keys_management()
+    print("✓ Admin & Keys/Providers Management OK")
+    print("\nALL 8 TEST SUITES PASSED SUCCESSFULLY!")

@@ -54,6 +54,11 @@ class KeyManager:
             if provider_id not in self._rr_indices:
                 self._rr_indices[provider_id] = 0
 
+    async def unregister_provider(self, provider_id: str) -> None:
+        async with self._lock:
+            self._provider_keys.pop(provider_id, None)
+            self._rr_indices.pop(provider_id, None)
+
     async def get_active_key(self, provider_id: str) -> Optional[str]:
         async with self._lock:
             keys = self._provider_keys.get(provider_id, [])

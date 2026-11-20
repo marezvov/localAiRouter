@@ -132,6 +132,8 @@ class AppConfig(BaseModel):
 
 class Secrets(BaseModel):
     gateway_api_key: str = "gw-secret-key-12345"
+    dashboard_username: str = "admin"
+    dashboard_password: Optional[str] = None
     provider_keys: Dict[str, List[str]] = Field(default_factory=dict)
     outbound_proxy: Optional[str] = None
 
@@ -143,6 +145,11 @@ _CURRENT_SECRETS: Optional[Secrets] = None
 def load_secrets() -> Secrets:
     env_data = dotenv_values(ENV_PATH)
     gateway_key = env_data.get("GATEWAY_API_KEY") or os.environ.get("GATEWAY_API_KEY", "gw-secret-key-12345")
+    dash_user = env_data.get("DASHBOARD_USERNAME") or os.environ.get("DASHBOARD_USERNAME", "admin")
+    dash_pass = env_data.get("DASHBOARD_PASSWORD") or os.environ.get("DASHBOARD_PASSWORD", None)
+    if dash_pass and not dash_pass.strip():
+        dash_pass = None
+
     proxy = env_data.get("OUTBOUND_PROXY") or os.environ.get("OUTBOUND_PROXY", None)
     if proxy and not proxy.strip():
         proxy = None
@@ -158,6 +165,8 @@ def load_secrets() -> Secrets:
 
     return Secrets(
         gateway_api_key=gateway_key,
+        dashboard_username=dash_user,
+        dashboard_password=dash_pass,
         provider_keys=provider_keys,
         outbound_proxy=proxy,
     )
@@ -194,3 +203,74 @@ def reload_config() -> tuple[AppConfig, Secrets]:
     _CURRENT_CONFIG = new_cfg
     _CURRENT_SECRETS = new_sec
     return _CURRENT_CONFIG, _CURRENT_SECRETS
+
+
+def update_env_file(updates: Dict[str, str]) -> None:
+    """
+    Атомарно обновляет или добавляет переменные в .env файл, сохраняя комментарии и структуру.
+    """
+    lines = []
+    if ENV_PATH.exists():
+        with open(ENV_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    updated_keys = set()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in line:
+            key, _, _ = line.partition("=")
+            key = key.strip()
+            if key in updates:
+                new_val = updates[key]
+                new_lines.append(f"{key}={new_val}\n")
+                updated_keys.add(key)
+                os.environ[key] = new_val
+                continue
+        new_lines.append(line)
+
+    for k, v in updates.items():
+        if k not in updated_keys:
+            if new_lines and not new_lines[-1].endswith("\n"):
+                new_lines.append("\n")
+            new_lines.append(f"{k}={v}\n")
+            os.environ[k] = v
+
+    temp_path = ENV_PATH.with_suffix(".tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+    temp_path.replace(ENV_PATH)
+
+
+def save_provider_to_config(provider_id: str, provider_dict: Dict[str, Any], remove: bool = False) -> None:
+    """
+    Добавляет, обновляет или удаляет секцию провайдера в config.yaml.
+    """
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Config file not found at {CONFIG_PATH}")
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if "providers" not in data or not isinstance(data["providers"], dict):
+        data["providers"] = {}
+
+    if remove:
+        if provider_id in data["providers"]:
+            del data["providers"][provider_id]
+        if "routing" in data and isinstance(data["routing"], dict) and "provider_priority" in data["routing"]:
+            if provider_id in data["routing"]["provider_priority"]:
+                data["routing"]["provider_priority"].remove(provider_id)
+    else:
+        if "models" not in provider_dict:
+            provider_dict["models"] = []
+        data["providers"][provider_id] = provider_dict
+        if "routing" in data and isinstance(data["routing"], dict) and "provider_priority" in data["routing"]:
+            if provider_id not in data["routing"]["provider_priority"]:
+                data["routing"]["provider_priority"].append(provider_id)
+
+    temp_path = CONFIG_PATH.with_suffix(".tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+    temp_path.replace(CONFIG_PATH)
+

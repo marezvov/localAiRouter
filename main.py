@@ -1,9 +1,11 @@
 import time
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
 
+import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,10 +85,12 @@ app.add_middleware(
 )
 
 
-# Авторизация по Bearer токену
+# Авторизация по Bearer токену (мастер-ключ шлюза или пароль дашборда)
 async def verify_auth(authorization: Optional[str] = Header(None)) -> bool:
     secrets = config_loader.get_secrets()
-    expected = secrets.gateway_api_key
+    valid_tokens = [secrets.gateway_api_key]
+    if secrets.dashboard_password:
+        valid_tokens.append(secrets.dashboard_password)
 
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization Header")
@@ -96,8 +100,8 @@ async def verify_auth(authorization: Optional[str] = Header(None)) -> bool:
         raise HTTPException(status_code=401, detail="Invalid Authorization header format. Expected 'Bearer <KEY>'")
 
     token = parts[1]
-    if token != expected:
-        raise HTTPException(status_code=401, detail="Invalid Gateway API Key")
+    if token not in valid_tokens:
+        raise HTTPException(status_code=401, detail="Invalid Gateway API Key or Dashboard Password")
 
     return True
 
@@ -268,6 +272,208 @@ async def check_all_keys_live() -> Dict[str, Any]:
 async def admin_check_keys(_auth: bool = Depends(verify_auth)):
     results = await check_all_keys_live()
     return {"status": "ok", "results": results}
+
+
+@app.post("/v1/admin/login")
+async def admin_login(request: Request):
+    """Авторизация в панели администратора по логину и паролю / мастер-ключу."""
+    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    username = body.get("username", "").strip()
+    password = body.get("password", "").strip()
+
+    secrets = config_loader.get_secrets()
+    valid_passwords = [secrets.gateway_api_key]
+    if secrets.dashboard_password:
+        valid_passwords.append(secrets.dashboard_password)
+
+    expected_user = secrets.dashboard_username or "admin"
+    if username and username.lower() != expected_user.lower() and username.lower() != "admin":
+        raise HTTPException(status_code=401, detail="Неверное имя пользователя")
+
+    if password not in valid_passwords:
+        raise HTTPException(status_code=401, detail="Неверный пароль или мастер-ключ шлюза")
+
+    token = secrets.dashboard_password or secrets.gateway_api_key
+    return {"status": "ok", "token": token, "username": expected_user}
+
+
+@app.get("/v1/admin/keys-config")
+async def get_keys_config(_auth: bool = Depends(verify_auth)):
+    """Возвращает полную конфигурацию ключей и провайдеров для администратора."""
+    cfg = config_loader.get_config()
+    secrets = config_loader.get_secrets()
+
+    providers_res = {}
+    for pid, pcfg in cfg.providers.items():
+        keys = secrets.provider_keys.get(pcfg.api_key_env, [])
+        providers_res[pid] = {
+            "name": pcfg.name,
+            "base_url": pcfg.base_url,
+            "api_key_env": pcfg.api_key_env,
+            "enabled": pcfg.enabled,
+            "use_proxy": pcfg.use_proxy,
+            "timeout_sec": pcfg.timeout_sec,
+            "keys": keys,
+            "models": [m.id for m in pcfg.models],
+        }
+
+    return {
+        "status": "ok",
+        "gateway_api_key": secrets.gateway_api_key,
+        "dashboard_username": secrets.dashboard_username,
+        "has_dashboard_password": bool(secrets.dashboard_password),
+        "outbound_proxy": secrets.outbound_proxy or "",
+        "providers": providers_res,
+    }
+
+
+@app.post("/v1/admin/save-keys")
+async def save_keys(request: Request, _auth: bool = Depends(verify_auth)):
+    """Сохраняет измененные ключи и сетевые настройки в .env и обновляет реестр на лету."""
+    body = await request.json()
+    updates = {}
+
+    if "gateway_api_key" in body and body["gateway_api_key"].strip():
+        updates["GATEWAY_API_KEY"] = body["gateway_api_key"].strip()
+
+    if "outbound_proxy" in body:
+        updates["OUTBOUND_PROXY"] = body["outbound_proxy"].strip()
+
+    if "dashboard_password" in body and body["dashboard_password"].strip():
+        updates["DASHBOARD_PASSWORD"] = body["dashboard_password"].strip()
+
+    provider_keys = body.get("provider_keys", {})
+    for env_name, klist in provider_keys.items():
+        if isinstance(klist, list):
+            updates[env_name] = ",".join([k.strip() for k in klist if k.strip()])
+        elif isinstance(klist, str):
+            updates[env_name] = klist.strip()
+
+    config_loader.update_env_file(updates)
+    new_cfg, new_sec = config_loader.reload_config()
+
+    if key_mgr:
+        for pid, pcfg in new_cfg.providers.items():
+            keys = new_sec.provider_keys.get(pcfg.api_key_env, [])
+            await key_mgr.register_provider_keys(pid, keys)
+
+    if discovery_svc:
+        discovery_svc.config = new_cfg
+        discovery_svc.outbound_proxy = new_sec.outbound_proxy
+
+    if router_svc:
+        router_svc.config = new_cfg
+        router_svc.outbound_proxy = new_sec.outbound_proxy
+
+    return {"status": "ok", "message": "Ключи и настройки успешно сохранены в .env"}
+
+
+@app.post("/v1/admin/save-provider")
+async def save_or_delete_provider(request: Request, _auth: bool = Depends(verify_auth)):
+    """Добавляет, редактирует или удаляет кастомного поставщика в config.yaml и .env."""
+    body = await request.json()
+    action = body.get("action", "save")
+    provider_id = body.get("provider_id", "").strip().lower()
+
+    if not provider_id or not re.match(r"^[a-z0-9_-]+$", provider_id):
+        raise HTTPException(
+            status_code=400,
+            detail="ID поставщика должен содержать только латинские буквы, цифры, дефис или подчеркивание."
+        )
+
+    if action == "delete":
+        config_loader.save_provider_to_config(provider_id, {}, remove=True)
+        new_cfg, new_sec = config_loader.reload_config()
+        if key_mgr:
+            await key_mgr.unregister_provider(provider_id)
+        if router_svc:
+            router_svc.config = new_cfg
+        if discovery_svc:
+            discovery_svc.config = new_cfg
+        return {"status": "ok", "message": f"Поставщик '{provider_id}' успешно удален"}
+
+    name = body.get("name", "").strip() or provider_id.capitalize()
+    base_url = body.get("base_url", "").strip().rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="Base URL обязателен")
+
+    api_key_env = body.get("api_key_env", "").strip() or f"{provider_id.upper()}_API_KEYS"
+    enabled = bool(body.get("enabled", True))
+    use_proxy = bool(body.get("use_proxy", False))
+    timeout_sec = float(body.get("timeout_sec", 60.0))
+
+    p_dict = {
+        "name": name,
+        "base_url": base_url,
+        "api_key_env": api_key_env,
+        "enabled": enabled,
+        "use_proxy": use_proxy,
+        "timeout_sec": timeout_sec,
+        "models": [],
+    }
+
+    config_loader.save_provider_to_config(provider_id, p_dict, remove=False)
+
+    keys = body.get("keys", [])
+    if isinstance(keys, str):
+        keys = [k.strip() for k in keys.split(",") if k.strip()]
+    if keys is not None:
+        config_loader.update_env_file({api_key_env: ",".join(keys)})
+
+    new_cfg, new_sec = config_loader.reload_config()
+
+    if key_mgr:
+        p_keys = new_sec.provider_keys.get(api_key_env, [])
+        await key_mgr.register_provider_keys(provider_id, p_keys)
+
+    if router_svc:
+        router_svc.config = new_cfg
+        router_svc.outbound_proxy = new_sec.outbound_proxy
+    if discovery_svc:
+        discovery_svc.config = new_cfg
+        discovery_svc.outbound_proxy = new_sec.outbound_proxy
+        asyncio.create_task(discovery_svc.refresh_all(force=True))
+
+    return {"status": "ok", "message": f"Поставщик '{provider_id}' успешно сохранен", "provider_id": provider_id}
+
+
+@app.post("/v1/admin/test-key")
+async def test_single_key(request: Request, _auth: bool = Depends(verify_auth)):
+    """Выполняет прямой микро-тест указанного ключа к указанному эндпоинту."""
+    body = await request.json()
+    base_url = body.get("base_url", "").strip().rstrip("/")
+    key = body.get("key", "").strip()
+    use_proxy = bool(body.get("use_proxy", False))
+
+    if not base_url or not key:
+        raise HTTPException(status_code=400, detail="base_url and key are required")
+
+    secrets = config_loader.get_secrets()
+    proxies = secrets.outbound_proxy if use_proxy else None
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+
+    start = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=8.0, proxy=proxies) as client:
+            resp = await client.get(f"{base_url}/models", headers=headers)
+            lat = round((time.time() - start) * 1000, 1)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    m_count = len(data.get("data", [])) if isinstance(data, dict) else 0
+                except Exception:
+                    m_count = 0
+                return {"ok": True, "status": "ACTIVE", "status_code": 200, "latency_ms": lat, "models_count": m_count}
+            elif resp.status_code in (401, 403):
+                return {"ok": False, "status": "UNAUTHORIZED", "status_code": resp.status_code, "latency_ms": lat, "error": f"HTTP {resp.status_code} Auth Failed"}
+            elif resp.status_code == 429:
+                return {"ok": False, "status": "RATE_LIMITED", "status_code": 429, "latency_ms": lat, "error": "HTTP 429 Rate Limited"}
+            else:
+                return {"ok": False, "status": f"HTTP_{resp.status_code}", "status_code": resp.status_code, "latency_ms": lat, "error": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        lat = round((time.time() - start) * 1000, 1)
+        return {"ok": False, "status": "ERROR", "latency_ms": lat, "error": str(e)[:60]}
+
 
 
 # -------------------------------------------------------------
@@ -582,6 +788,15 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
         .gpu-stat-box {{ background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 12px; }}
         .gpu-stat-title {{ font-size: 11px; text-transform: uppercase; color: #94a3b8; font-weight: 600; margin-bottom: 4px; }}
         .gpu-stat-val {{ font-size: 18px; font-weight: 700; color: #f8fafc; }}
+
+        .admin-input {{ width: 100%; padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #f1f5f9; font-family: monospace; font-size: 13px; box-sizing: border-box; }}
+        .admin-input:focus {{ border-color: #38bdf8; outline: none; }}
+        .modal-overlay {{ position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.75); display: flex; align-items: center; justify-content: center; z-index: 1000; }}
+        .modal-content {{ background: #1e293b; border: 1px solid #475569; border-radius: 12px; width: 100%; max-width: 540px; padding: 24px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5); }}
+        .key-row {{ display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }}
+        .badge-ping {{ padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; font-family: monospace; display: inline-block; }}
+        .badge-ping-ok {{ background: #064e3b; color: #34d399; border: 1px solid #059669; }}
+        .badge-ping-err {{ background: #7f1d1d; color: #f87171; border: 1px solid #dc2626; }}
     </style>
 </head>
 <body>
@@ -602,6 +817,9 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
             </button>
             <button id="btn-tab-system" class="tab-btn" onclick="switchTab('system')">
                 &#128421; Система и Температуры
+            </button>
+            <button id="btn-tab-keys" class="tab-btn" onclick="switchTab('keys')">
+                &#128273; Ключи и Провайдеры
             </button>
         </div>
 
@@ -685,7 +903,549 @@ def render_health_dashboard_html(data: Dict[str, Any], cfg: config_loader.AppCon
             </div>
         </div>
 
-        <!-- TAB 2: SYSTEM & HARDWARE TEMPERATURES -->
+        <!-- TAB 3: KEYS & PROVIDERS MANAGEMENT -->
+        <div id="tab-keys" class="tab-pane" style="display: none;">
+            <!-- State 1: Locked / Login Box -->
+            <div id="keys-auth-box" style="max-width: 480px; margin: 40px auto; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 30px; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.3);">
+                <div style="font-size: 42px; margin-bottom: 12px;">&#128274;</div>
+                <h3 style="font-size: 19px; color: #f8fafc; margin-bottom: 8px;">Панель администратора</h3>
+                <p style="font-size: 13px; color: #94a3b8; line-height: 1.5; margin-bottom: 22px;">
+                    Управление ключами, поставщиками и секретами защищено. Введите мастер-ключ шлюза (GATEWAY_API_KEY) или пароль админа.
+                </p>
+                <div style="margin-bottom: 16px; text-align: left;">
+                    <label style="font-size: 12px; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 6px;">Мастер-ключ или пароль:</label>
+                    <input type="password" id="auth-pwd-input" placeholder="Введите ключ или пароль..." class="admin-input" style="font-size: 14px; padding: 10px 14px;" onkeydown="if(event.key==='Enter') doLogin()">
+                </div>
+                <div id="auth-error-msg" style="display: none; background: #7f1d1d33; border: 1px solid #ef4444; border-radius: 6px; padding: 8px; color: #f87171; font-size: 12px; margin-bottom: 14px;"></div>
+                <button class="action-btn" style="width: 100%; padding: 11px; font-size: 14px;" onclick="doLogin()">&#128273; Войти в панель управления</button>
+            </div>
+
+            <!-- State 2: Authenticated Keys & Providers Management Panel -->
+            <div id="keys-admin-panel" style="display: none;">
+                <!-- Admin Header Bar -->
+                <div style="display: flex; justify-content: space-between; align-items: center; background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px 20px; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="color: #10b981; font-size: 18px;">&#9679;</span>
+                        <span style="font-size: 14px; font-weight: 600; color: #f8fafc;">Сессия администратора активна</span>
+                    </div>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <button class="action-btn" style="background: #059669;" onclick="openNewProviderModal()">&#10133; Добавить поставщика</button>
+                        <button class="action-btn" style="background: #0284c7;" onclick="saveAllKeysAndSecrets()">&#128190; Сохранить все ключи в .env</button>
+                        <button class="action-btn btn-secondary" onclick="doLogout()">&#128682; Выйти</button>
+                    </div>
+                </div>
+
+                <!-- Global Gateway Secrets Card -->
+                <div class="table-card">
+                    <h3>&#9881; Системные секреты и шлюз (.env)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 10px;">
+                        <div>
+                            <label style="font-size: 12px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 6px;">GATEWAY_API_KEY (Мастер-ключ)</label>
+                            <div style="display: flex; gap: 6px;">
+                                <input type="password" id="sys-gateway-key" class="admin-input" style="flex: 1;">
+                                <button class="action-btn btn-secondary" onclick="toggleInputVisibility('sys-gateway-key')">&#128065;</button>
+                            </div>
+                        </div>
+                        <div>
+                            <label style="font-size: 12px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 6px;">OUTBOUND_PROXY (Исходящий прокси)</label>
+                            <input type="text" id="sys-outbound-proxy" placeholder="например socks5://127.0.0.1:1080" class="admin-input">
+                        </div>
+                        <div>
+                            <label style="font-size: 12px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 6px;">DASHBOARD_PASSWORD (Пароль дашборда)</label>
+                            <div style="display: flex; gap: 6px;">
+                                <input type="password" id="sys-dash-pwd" placeholder="Оставьте пустым для входа по мастер-ключу" class="admin-input" style="flex: 1;">
+                                <button class="action-btn btn-secondary" onclick="toggleInputVisibility('sys-dash-pwd')">&#128065;</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Providers Cards Container -->
+                <div id="providers-cards-container">
+                    <div style="color: #64748b; padding: 20px; text-align: center;">Загрузка конфигурации поставщиков...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- MODAL: ADD NEW CUSTOM PROVIDER -->
+        <div id="modal-new-provider" class="modal-overlay" style="display: none;">
+            <div class="modal-content">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                    <h3 style="font-size: 17px; font-weight: 700; color: #38bdf8;">&#10133; Добавить нового поставщика моделей</h3>
+                    <button class="action-btn btn-secondary" style="padding: 4px 8px;" onclick="closeNewProviderModal()">✕</button>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 14px;">
+                    <div>
+                        <label style="font-size: 12px; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 4px;">ID поставщика (латиница, без пробелов):</label>
+                        <input type="text" id="new-p-id" placeholder="например: deepseek, together, mistral" class="admin-input" oninput="autoUpdateEnvVarName()">
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 4px;">Отображаемое имя:</label>
+                        <input type="text" id="new-p-name" placeholder="например: DeepSeek Official" class="admin-input">
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 4px;">Base URL (OpenAI-совместимый эндпоинт):</label>
+                        <input type="text" id="new-p-url" placeholder="например: https://api.deepseek.com/v1" class="admin-input">
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 4px;">Переменная в .env для ключей:</label>
+                        <input type="text" id="new-p-env" placeholder="DEEPSEEK_API_KEYS" class="admin-input">
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 4px;">API Ключи (через запятую, если несколько):</label>
+                        <textarea id="new-p-keys" placeholder="sk-..." class="admin-input" style="height: 60px; resize: vertical;"></textarea>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="new-p-proxy" style="cursor: pointer; width: 16px; height: 16px;">
+                        <label for="new-p-proxy" style="font-size: 13px; color: #e2e8f0; cursor: pointer;">Использовать исходящий прокси (OUTBOUND_PROXY)</label>
+                    </div>
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+                    <button class="action-btn btn-secondary" onclick="closeNewProviderModal()">Отмена</button>
+                    <button class="action-btn" style="background: #059669;" onclick="submitNewProvider()">✓ Добавить и активировать</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function toggleInputVisibility(id) {{
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.type = el.type === 'password' ? 'text' : 'password';
+        }}
+
+        function getAuthToken() {{
+            return sessionStorage.getItem('gateway_auth_token') || '';
+        }}
+
+        function setAuthToken(token) {{
+            if (token) {{
+                sessionStorage.setItem('gateway_auth_token', token);
+            }} else {{
+                sessionStorage.removeItem('gateway_auth_token');
+            }}
+        }}
+
+        function switchTab(tabId) {{
+            try {{
+                localStorage.setItem('active_tab', tabId);
+            }} catch(e) {{}}
+            document.querySelectorAll('.tab-pane').forEach(el => el.style.display = 'none');
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+
+            const pane = document.getElementById('tab-' + tabId);
+            const btn = document.getElementById('btn-tab-' + tabId);
+            if (pane) pane.style.display = 'block';
+            if (btn) btn.classList.add('active');
+
+            if (tabId === 'keys') {{
+                checkKeysAuth();
+            }}
+        }}
+
+        function checkKeysAuth() {{
+            const token = getAuthToken();
+            const authBox = document.getElementById('keys-auth-box');
+            const adminPanel = document.getElementById('keys-admin-panel');
+            if (!token) {{
+                if (authBox) authBox.style.display = 'block';
+                if (adminPanel) adminPanel.style.display = 'none';
+            }} else {{
+                if (authBox) authBox.style.display = 'none';
+                if (adminPanel) adminPanel.style.display = 'block';
+                loadKeysConfig();
+            }}
+        }}
+
+        async function doLogin() {{
+            const pwdInput = document.getElementById('auth-pwd-input');
+            const errMsg = document.getElementById('auth-error-msg');
+            const pwd = (pwdInput ? pwdInput.value : '').trim();
+            if (!pwd) {{
+                if (errMsg) {{ errMsg.innerText = 'Пожалуйста, введите пароль или мастер-ключ'; errMsg.style.display = 'block'; }}
+                return;
+            }}
+            try {{
+                const res = await fetch('/v1/admin/login', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ password: pwd }})
+                }});
+                const data = await res.json();
+                if (res.ok && data.token) {{
+                    setAuthToken(data.token);
+                    if (errMsg) errMsg.style.display = 'none';
+                    checkKeysAuth();
+                }} else {{
+                    if (errMsg) {{ errMsg.innerText = data.detail || 'Неверный пароль или мастер-ключ'; errMsg.style.display = 'block'; }}
+                }}
+            }} catch (e) {{
+                if (errMsg) {{ errMsg.innerText = 'Ошибка подключения: ' + e; errMsg.style.display = 'block'; }}
+            }}
+        }}
+
+        function doLogout() {{
+            setAuthToken('');
+            checkKeysAuth();
+        }}
+
+        let activeKeysConfig = null;
+
+        async function loadKeysConfig() {{
+            const token = getAuthToken();
+            if (!token) return;
+            try {{
+                const res = await fetch('/v1/admin/keys-config', {{
+                    headers: {{ 'Authorization': 'Bearer ' + token }}
+                }});
+                if (res.status === 401) {{
+                    doLogout();
+                    return;
+                }}
+                const data = await res.json();
+                activeKeysConfig = data;
+                renderKeysConfig(data);
+            }} catch (e) {{
+                console.error('Failed to load keys config:', e);
+            }}
+        }}
+
+        function renderKeysConfig(data) {{
+            const gwKeyInput = document.getElementById('sys-gateway-key');
+            const proxyInput = document.getElementById('sys-outbound-proxy');
+            const dashPwdInput = document.getElementById('sys-dash-pwd');
+
+            if (gwKeyInput) gwKeyInput.value = data.gateway_api_key || '';
+            if (proxyInput) proxyInput.value = data.outbound_proxy || '';
+            if (dashPwdInput && data.has_dashboard_password) dashPwdInput.placeholder = 'Пароль установлен (оставьте пустым чтобы не менять)';
+
+            const container = document.getElementById('providers-cards-container');
+            if (!container) return;
+
+            let html = '';
+            const providers = data.providers || {{}};
+            const pids = Object.keys(providers);
+
+            if (pids.length === 0) {{
+                container.innerHTML = '<div style="color: #64748b; padding: 20px; text-align: center;">Нет настроенных поставщиков. Нажмите «Добавить поставщика».</div>';
+                return;
+            }}
+
+            for (const pid of pids) {{
+                const p = providers[pid];
+                const keys = p.keys || [];
+                const isEnabled = p.enabled !== false;
+                const useProxy = p.use_proxy === true;
+
+                let keysRowsHtml = '';
+                if (keys.length === 0) {{
+                    keysRowsHtml = '<div style="font-size: 12px; color: #64748b; margin-bottom: 10px;">Нет активных ключей в .env</div>';
+                }} else {{
+                    for (let i = 0; i < keys.length; i++) {{
+                        const k = keys[i];
+                        keysRowsHtml += `
+                        <div class="key-row" id="row-key-${{pid}}-${{i}}">
+                            <input type="password" id="input-key-${{pid}}-${{i}}" value="${{k}}" class="admin-input" style="flex: 1; font-family: monospace;">
+                            <button class="action-btn btn-secondary" style="padding: 6px 10px;" onclick="toggleInputVisibility('input-key-${{pid}}-${{i}}')">&#128065;</button>
+                            <button class="action-btn" style="background: #0284c7; padding: 6px 12px;" onclick="testKeyLive('${{pid}}', ${{i}})">&#9889; Тест</button>
+                            <span id="badge-key-${{pid}}-${{i}}"></span>
+                            <button class="action-btn btn-danger" style="padding: 6px 10px;" onclick="deleteKeyRow('${{pid}}', ${{i}})">&#128465;</button>
+                        </div>
+                        `;
+                    }}
+                }}
+
+                html += `
+                <div class="table-card" id="card-prov-${{pid}}" style="margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 12px; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="font-size: 16px; font-weight: 700; color: #38bdf8;">${{p.name}}</span>
+                            <span style="background: #0f172a; border: 1px solid #334155; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-family: monospace; color: #94a3b8;">${{pid}}</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <label style="font-size: 12px; color: #e2e8f0; display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                                <input type="checkbox" id="prov-enabled-${{pid}}" ${{isEnabled ? 'checked' : ''}} style="cursor: pointer;"> Включен
+                            </label>
+                            <label style="font-size: 12px; color: #e2e8f0; display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                                <input type="checkbox" id="prov-proxy-${{pid}}" ${{useProxy ? 'checked' : ''}} style="cursor: pointer;"> Прокси
+                            </label>
+                            <button class="action-btn btn-danger" style="padding: 5px 10px; font-size: 12px;" onclick="deleteProvider('${{pid}}')">&#128465; Удалить</button>
+                        </div>
+                    </div>
+
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 14px;">
+                        <div>
+                            <label style="font-size: 11px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 4px;">Base URL:</label>
+                            <input type="text" id="prov-url-${{pid}}" value="${{p.base_url}}" class="admin-input">
+                        </div>
+                        <div>
+                            <label style="font-size: 11px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 4px;">Переменная ключей в .env:</label>
+                            <input type="text" id="prov-env-${{pid}}" value="${{p.api_key_env}}" class="admin-input" readonly style="opacity: 0.8;">
+                        </div>
+                    </div>
+
+                    <div>
+                        <label style="font-size: 12px; color: #94a3b8; font-weight: 600; display: block; margin-bottom: 8px;">Пул API ключей (Round-Robin):</label>
+                        <div id="keys-list-${{pid}}">
+                            ${{keysRowsHtml}}
+                        </div>
+                        <div style="display: flex; gap: 8px; margin-top: 10px;">
+                            <input type="text" id="new-key-for-${{pid}}" placeholder="Вставьте новый API ключ..." class="admin-input" style="flex: 1;">
+                            <button class="action-btn" style="background: #059669;" onclick="addNewKeyToProviderList('${{pid}}')">&#10133; Добавить ключ</button>
+                        </div>
+                    </div>
+                </div>
+                `;
+            }}
+
+            container.innerHTML = html;
+        }}
+
+        function addNewKeyToProviderList(pid) {{
+            const input = document.getElementById('new-key-for-' + pid);
+            if (!input || !input.value.trim()) return;
+            const newKey = input.value.trim();
+            if (!activeKeysConfig || !activeKeysConfig.providers[pid]) return;
+            activeKeysConfig.providers[pid].keys.push(newKey);
+            input.value = '';
+            renderKeysConfig(activeKeysConfig);
+        }}
+
+        function deleteKeyRow(pid, idx) {{
+            if (!activeKeysConfig || !activeKeysConfig.providers[pid]) return;
+            activeKeysConfig.providers[pid].keys.splice(idx, 1);
+            renderKeysConfig(activeKeysConfig);
+        }}
+
+        async function testKeyLive(pid, idx) {{
+            const keyInput = document.getElementById('input-key-' + pid + '-' + idx);
+            const badge = document.getElementById('badge-key-' + pid + '-' + idx);
+            const urlInput = document.getElementById('prov-url-' + pid);
+            const proxyCheck = document.getElementById('prov-proxy-' + pid);
+
+            if (!keyInput || !keyInput.value.trim()) return;
+            const key = keyInput.value.trim();
+            const baseUrl = urlInput ? urlInput.value.trim() : '';
+            const useProxy = proxyCheck ? proxyCheck.checked : false;
+
+            if (badge) {{
+                badge.className = 'badge-ping';
+                badge.style.background = '#334155';
+                badge.style.color = '#f1f5f9';
+                badge.innerText = 'Проверка...';
+            }}
+
+            const token = getAuthToken();
+            try {{
+                const res = await fetch('/v1/admin/test-key', {{
+                    method: 'POST',
+                    headers: {{
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify({{ base_url: baseUrl, key: key, use_proxy: useProxy }})
+                }});
+                const data = await res.json();
+                if (badge) {{
+                    if (data.ok) {{
+                        badge.className = 'badge-ping badge-ping-ok';
+                        badge.innerText = '✓ ' + data.status + ' (' + data.latency_ms + 'ms)';
+                    }} else {{
+                        badge.className = 'badge-ping badge-ping-err';
+                        badge.innerText = '✕ ' + (data.error || 'Ошибка ' + data.status_code);
+                    }}
+                }}
+            }} catch (e) {{
+                if (badge) {{
+                    badge.className = 'badge-ping badge-ping-err';
+                    badge.innerText = '✕ Ошибка: ' + e;
+                }}
+            }}
+        }}
+
+        async function saveAllKeysAndSecrets() {{
+            const token = getAuthToken();
+            if (!token) return;
+
+            const gwKey = (document.getElementById('sys-gateway-key') || {{}}).value || '';
+            const proxy = (document.getElementById('sys-outbound-proxy') || {{}}).value || '';
+            const dashPwd = (document.getElementById('sys-dash-pwd') || {{}}).value || '';
+
+            const providerKeys = {{}};
+            if (activeKeysConfig && activeKeysConfig.providers) {{
+                for (const pid of Object.keys(activeKeysConfig.providers)) {{
+                    const p = activeKeysConfig.providers[pid];
+                    const envVar = p.api_key_env;
+                    const keys = [];
+                    const container = document.getElementById('keys-list-' + pid);
+                    if (container) {{
+                        const inputs = container.querySelectorAll('input[type="password"], input[type="text"]');
+                        inputs.forEach(inp => {{
+                            if (inp.value && inp.value.trim()) keys.push(inp.value.trim());
+                        }});
+                    }} else {{
+                        keys.push(...(p.keys || []));
+                    }}
+                    providerKeys[envVar] = keys;
+                }}
+            }}
+
+            const payload = {{
+                gateway_api_key: gwKey.trim(),
+                outbound_proxy: proxy.trim(),
+                provider_keys: providerKeys
+            }};
+            if (dashPwd.trim()) {{
+                payload.dashboard_password = dashPwd.trim();
+            }}
+
+            try {{
+                const res = await fetch('/v1/admin/save-keys', {{
+                    method: 'POST',
+                    headers: {{
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify(payload)
+                }});
+                const data = await res.json();
+                if (res.ok) {{
+                    alert('✓ Секреты и ключи успешно сохранены в .env и обновлены в шлюзе!');
+                    loadKeysConfig();
+                }} else {{
+                    alert('Ошибка при сохранении: ' + (data.detail || JSON.stringify(data)));
+                }}
+            }} catch (e) {{
+                alert('Ошибка сети при сохранении: ' + e);
+            }}
+        }}
+
+        function openNewProviderModal() {{
+            const m = document.getElementById('modal-new-provider');
+            if (m) m.style.display = 'flex';
+        }}
+
+        function closeNewProviderModal() {{
+            const m = document.getElementById('modal-new-provider');
+            if (m) m.style.display = 'none';
+        }}
+
+        function autoUpdateEnvVarName() {{
+            const idInput = document.getElementById('new-p-id');
+            const envInput = document.getElementById('new-p-env');
+            if (idInput && envInput) {{
+                const cleaned = idInput.value.replace(/[^a-zA-Z0-9_]/g, '').toUpperCase();
+                envInput.value = cleaned ? cleaned + '_API_KEYS' : '';
+            }}
+        }}
+
+        async function submitNewProvider() {{
+            const token = getAuthToken();
+            if (!token) return;
+
+            const pid = (document.getElementById('new-p-id') || {{}}).value || '';
+            const name = (document.getElementById('new-p-name') || {{}}).value || '';
+            const url = (document.getElementById('new-p-url') || {{}}).value || '';
+            const envVar = (document.getElementById('new-p-env') || {{}}).value || '';
+            const keysRaw = (document.getElementById('new-p-keys') || {{}}).value || '';
+            const useProxy = (document.getElementById('new-p-proxy') || {{}}).checked || false;
+
+            if (!pid.trim()) {{ alert('Укажите ID поставщика'); return; }}
+            if (!url.trim()) {{ alert('Укажите Base URL поставщика'); return; }}
+
+            const payload = {{
+                action: 'save',
+                provider_id: pid.trim().toLowerCase(),
+                name: name.trim() || pid.trim(),
+                base_url: url.trim(),
+                api_key_env: envVar.trim() || (pid.trim().toUpperCase() + '_API_KEYS'),
+                keys: keysRaw.split(',').map(s => s.trim()).filter(Boolean),
+                use_proxy: useProxy,
+                enabled: true
+            }};
+
+            try {{
+                const res = await fetch('/v1/admin/save-provider', {{
+                    method: 'POST',
+                    headers: {{
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify(payload)
+                }});
+                const data = await res.json();
+                if (res.ok) {{
+                    closeNewProviderModal();
+                    alert('✓ Поставщик ' + pid + ' успешно добавлен и активирован!');
+                    loadKeysConfig();
+                }} else {{
+                    alert('Ошибка при добавлении: ' + (data.detail || JSON.stringify(data)));
+                }}
+            }} catch (e) {{
+                alert('Ошибка сети: ' + e);
+            }}
+        }}
+
+        async function deleteProvider(pid) {{
+            if (!confirm('Вы уверены, что хотите удалить поставщика \"' + pid + '\" из конфигурации?')) return;
+            const token = getAuthToken();
+            if (!token) return;
+
+            try {{
+                const res = await fetch('/v1/admin/save-provider', {{
+                    method: 'POST',
+                    headers: {{
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify({{ action: 'delete', provider_id: pid }})
+                }});
+                const data = await res.json();
+                if (res.ok) {{
+                    alert('✓ Поставщик ' + pid + ' удален.');
+                    loadKeysConfig();
+                }} else {{
+                    alert('Ошибка: ' + (data.detail || JSON.stringify(data)));
+                }}
+            }} catch (e) {{
+                alert('Ошибка: ' + e);
+            }}
+        }}
+
+        async function apiAction(endpoint, name) {{
+            let key = getAuthToken();
+            if (!key) {{
+                key = prompt("Enter Gateway Master API Key for authorization:", "{master_key}");
+                if (!key) return;
+                setAuthToken(key);
+            }}
+            try {{
+                const res = await fetch(endpoint, {{
+                    method: 'POST',
+                    headers: {{ 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' }}
+                }});
+                const json = await res.json();
+                alert(name + " result: " + JSON.stringify(json, null, 2));
+                location.reload();
+            }} catch (e) {{
+                alert("Error: " + e);
+            }}
+        }}
+
+        // Восстановление активной вкладки после автообновления
+        const savedTab = localStorage.getItem('active_tab') || 'gateway';
+        switchTab(savedTab);
+
+        // Автообновление каждые 10 секунд (пропускаем если открыта вкладка ключей)
+        setTimeout(() => {{
+            if (localStorage.getItem('active_tab') !== 'keys') {{
+                location.reload();
+            }}
+        }}, 10000);
+    </script>
+</body>
+</html>
         <div id="tab-system" class="tab-pane" style="display: none;">
             <div class="grid">
                 <div class="card">
